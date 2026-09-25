@@ -1,0 +1,8 @@
+{
+  "assets": [
+    {"keyword":"instagram","aliases":["meta"],"file":"instagram.png"},
+    {"keyword":"chatgpt","aliases":["openai"],"file":"chatgpt.png"},
+    {"keyword":"java","aliases":["spring","spring boot"],"file":"java.png"},
+    {"keyword":"github","aliases":[],"file":"github.png"}
+  ]
+}
