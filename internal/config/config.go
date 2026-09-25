@@ -94,8 +94,8 @@ func Default() Config {
 		Output:   OutputConfig{Width: 1080, Height: 1920, FPS: 30, CRF: 18, Preset: "medium", AudioBitrate: "192k"},
 		Cuts:     CutConfig{Enabled: true, NoiseDB: -42, MinSilence: 1.10, KeepSilence: 0.25, MinKeepSegment: 0.20},
 		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 82, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 6, Shadow: 0, MarginV: 560, SafeMargin: 96, MaxWords: 6, MaxCharsPerLine: 24, MaxLines: 2, Uppercase: true, ActiveWord: true},
-		Zoom:     ZoomConfig{Enabled: true, Mild: 1.035, Punch: 1.08, MinGap: 5.0, Duration: 1.0},
-		Broll:    BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 3},
+		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
+		Broll:    BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 4},
 	}
 }
 

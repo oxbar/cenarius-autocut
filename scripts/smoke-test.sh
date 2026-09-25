@@ -23,10 +23,12 @@ if ! "$FFMPEG_BIN" -hide_banner -filters 2>/dev/null | awk '$2 == "ass" { found=
 fi
 
 
-# Local visual asset: smoke must exercise image overlay + generated SFX without network.
-"$FFMPEG_BIN" -hide_banner -loglevel error -y -f lavfi -i "color=c=0x101820:s=1200x700:d=0.1" -frames:v 1 "$TMP/assets/technology.png"
+# Local MOVING B-roll: smoke must exercise real video split-screen + SFX without network.
+"$FFMPEG_BIN" -hide_banner -loglevel error -y \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=4" \
+  -vf "hue=s=0.7" -an -c:v libx264 -pix_fmt yuv420p "$TMP/assets/technology.mp4"
 cat > "$TMP/manifest.json" <<JSON
-{"assets":[{"keyword":"tecnologia","aliases":["tecnologias"],"file":"technology.png"}]}
+{"assets":[{"keyword":"tecnologia","aliases":["tecnologias"],"file":"technology.mp4"}]}
 JSON
 
 # 6s synthetic portrait source at 24 fps. This intentionally differs from the
@@ -61,8 +63,8 @@ cat > "$TMP/config.json" <<JSON
   "output": {"width":1080,"height":1920,"fps":30,"crf":18,"preset":"medium","audio_bitrate":"192k"},
   "cuts": {"enabled":false,"noise_db":-35,"min_silence":0.85,"keep_silence":0.18,"min_keep_segment":0.15},
   "captions": {"enabled":true,"font_name":"Arial","font_size":72,"primary_color":"&H00FFFFFF","highlight_color":"&H0000D7FF","outline_color":"&H00000000","outline":5,"shadow":1,"margin_v":420,"max_words":5,"uppercase":true},
-  "zoom": {"enabled":true,"mild":1.055,"punch":1.10,"min_gap":3.0,"duration":1.2},
-  "broll": {"enabled":true,"asset_dir":"$TMP/assets","manifest":"$TMP/manifest.json","max_events":3}
+  "zoom": {"enabled":true,"mild":1.06,"punch":1.10,"min_gap":3.0,"duration":0.85},
+  "broll": {"enabled":true,"asset_dir":"$TMP/assets","manifest":"$TMP/manifest.json","max_events":4}
 }
 JSON
 mkdir -p "$ROOT/bin"
@@ -75,6 +77,7 @@ awk -v a="$IN_DUR" -v b="$OUT_DUR" 'BEGIN { d=a-b; if (d<0) d=-d; if (d>0.20) { 
 [ -s "$TMP/out/debug.log" ] || { echo "ERRO: debug.log não foi gerado" >&2; exit 1; }
 [ -s "$TMP/out/assets-attribution.json" ] || { echo "ERRO: assets-attribution.json não foi gerado" >&2; exit 1; }
 grep -q '"asset"' "$TMP/out/edit-plan.json" || { echo "ERRO: overlay local não foi resolvido" >&2; cat "$TMP/out/edit-plan.json" >&2; exit 1; }
+grep -q '"asset_type": "video"' "$TMP/out/edit-plan.json" || { echo "ERRO: B-roll local não foi reconhecido como vídeo" >&2; cat "$TMP/out/edit-plan.json" >&2; exit 1; }
 grep -q '"sfx"' "$TMP/out/edit-plan.json" || { echo "ERRO: SFX não entrou no plano" >&2; exit 1; }
 echo "duration input=${IN_DUR}s output=${OUT_DUR}s"
 echo "debug log: $TMP/out/debug.log"

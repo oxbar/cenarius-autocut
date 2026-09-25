@@ -48,15 +48,15 @@
   },
   "zoom": {
     "enabled": true,
-    "mild": 1.035,
-    "punch": 1.08,
-    "min_gap": 5.0,
+    "mild": 1.06,
+    "punch": 1.1,
+    "min_gap": 4.0,
     "duration": 1.0
   },
   "broll": {
     "enabled": true,
     "asset_dir": "./assets/broll",
     "manifest": "./assets/manifest.json",
-    "max_events": 3
+    "max_events": 4
   }
 }

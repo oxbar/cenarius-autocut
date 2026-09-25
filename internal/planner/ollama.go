@@ -21,25 +21,30 @@ func WithOllama(ctx context.Context, base Plan, tr transcribe.Transcript, cfg co
 		logger.Info("planner.ollama.skip", "reason", "disabled")
 		return base
 	}
-	b, _ := json.Marshal(tr.Segments)
-	prompt := `Você é diretor/editor profissional de vídeos verticais estilo Shorts/Reels em português brasileiro. Analise a transcrição com timestamps e devolva SOMENTE JSON válido neste formato:
-{"zooms":[{"start":0.0,"end":1.0,"scale":1.04,"reason":"..."}],"overlays":[{"start":2.0,"end":4.0,"keyword":"chatgpt","query":"ChatGPT OpenAI interface","position":"bottom","mode":"bottom","reason":"..."}],"sfx":[{"time":2.0,"name":"pop","gain_db":-22,"reason":"..."}],"emphasis":["PALAVRA"]}.
+	transcriptJSON := compactTranscriptJSON(tr)
+	prompt := `Você é um diretor e editor profissional de Reels/Shorts. Seu trabalho NÃO é só colocar legendas: você cria ritmo visual como um editor humano, usando o apresentador como A-roll e inserindo B-roll real quando ele aumenta compreensão/retenção.
 
-Regras editoriais:
-- O apresentador é o foco. Efeitos existem para sustentar a história, não para poluir.
-- Em ~20-30s: 1-3 zooms, 1-3 overlays e no máximo 3 SFX.
-- Zoom apenas em gancho, mudança clara de ideia, reação ou punchline.
-- Overlay apenas para algo realmente visual: pessoa, empresa, app, produto, site, linguagem, ferramenta, notícia, objeto ou conceito visual claro.
-- query deve ser uma busca visual curta em inglês ou português, sem frases abstratas.
-- mode permitido: bottom (imagem nos 40% inferiores), fullscreen (imagem cobre a tela por pouco tempo), card (imagem menor em card central/inferior).
-- Prefira bottom/card. Use fullscreen por no máximo ~1.8s quando a imagem merece foco total.
-- Não repita o mesmo assunto visual.
-- Não use "ia" isoladamente se não houver uma referência visual concreta; prefira "artificial intelligence computer technology".
-- SFX permitido: pop para entrada de card/overlay; whoosh para fullscreen ou mudança forte. Ganho entre -30 e -16 dB.
-- Não invente fatos nem entidades ausentes da fala.
-- Destaque no máximo 3 palavras realmente importantes.
+Devolva SOMENTE JSON válido:
+{"zooms":[{"start":0.0,"end":0.8,"scale":1.07,"reason":"gancho"}],"overlays":[{"start":2.0,"end":4.5,"keyword":"programação","query":"software developer coding computer screen","position":"bottom","mode":"reaction","reason":"B-roll contextual"}],"sfx":[{"time":2.0,"name":"whoosh","gain_db":-24,"reason":"entrada B-roll"}],"emphasis":["PALAVRA"]}.
 
-Transcrição: ` + string(b)
+REGRAS DE DIREÇÃO:
+- Vídeo de 20-30s deve ter normalmente 2-4 mudanças visuais relevantes, espaçadas ~3-7s, se a fala permitir.
+- Não invente fatos. Você PODE escolher B-roll atmosférico que represente um conceito falado (ex.: tecnologia -> software developer coding; mundo + tecnologia -> global digital network).
+- O primeiro segundo precisa de um punch zoom perceptível (1.06-1.10), sem exagero.
+- Use mode=reaction para colocar B-roll em movimento na metade inferior enquanto o apresentador continua visível em cima, estilo react/podcast. Esse é o modo preferido.
+- Use mode=fullscreen por 1.0-1.8s para uma cutaway forte.
+- Use mode=card apenas para logo, print/interface ou entidade que funcione melhor como card.
+- query deve descrever IMAGENS/VÍDEOS concretos pesquisáveis, de preferência em inglês. Nunca use query abstrata.
+- Não repita a mesma query/keyword.
+- Em fala genérica, prefira cenas de computador, programação, smartphone, data center, rede digital, creator gravando, conforme o trecho realmente disser.
+- SFX: whoosh em reaction/fullscreen; pop em card. No máximo 4, ganho -30 a -18dB.
+- Zoom: 2-4 no máximo. Em punchline/mudança, 1.08-1.12. Em transição suave, 1.04-1.07.
+- overlay deve durar 1.4-3.0s.
+- Não deixe 8+ segundos sem alguma mudança visual se houver uma ideia visualizável.
+- Destaque no máximo 3 palavras importantes.
+
+A transcrição abaixo traz palavras com timestamps em segundos. Use esses tempos com precisão:
+` + transcriptJSON
 	reqBody, _ := json.Marshal(map[string]any{"model": cfg.Ollama.Model, "prompt": prompt, "stream": false, "format": "json"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.Ollama.URL, "/")+"/api/generate", bytes.NewReader(reqBody))
 	if err != nil {
@@ -67,6 +72,7 @@ Transcrição: ` + string(b)
 		logger.Warn("planner.ollama.invalid_wrapper")
 		return base
 	}
+	logger.Debug("planner.ollama.raw", "response", wrap.Response)
 	var p Plan
 	if err := json.Unmarshal([]byte(wrap.Response), &p); err != nil {
 		logger.Warn("planner.ollama.invalid_json", "error", err, "response", wrap.Response)
@@ -78,28 +84,57 @@ Transcrição: ` + string(b)
 }
 
 func mergePlans(base, ai Plan, cfg config.Config) Plan {
-	out := base
-	// AI events have priority, but preserve heuristic events when the model omitted
-	// a useful category. De-duplication keeps the result restrained.
+	// AI is the director. When it produced visual events, place them first and
+	// use heuristics only to fill remaining gaps. This avoids a generic heuristic
+	// overlay blocking a much better semantic B-roll decision at the same time.
+	out := Plan{}
 	for _, z := range ai.Zooms {
-		if !zoomNear(z, out.Zooms, 1.0) {
+		if !zoomNear(z, out.Zooms, .75) {
+			out.Zooms = append(out.Zooms, z)
+		}
+	}
+	for _, z := range base.Zooms {
+		if len(out.Zooms) >= 4 {
+			break
+		}
+		if !zoomNear(z, out.Zooms, .75) {
 			out.Zooms = append(out.Zooms, z)
 		}
 	}
 	for _, o := range ai.Overlays {
-		if !overlayNear(o, out.Overlays, 1.5) && len(out.Overlays) < cfg.Broll.MaxEvents {
+		if len(out.Overlays) >= cfg.Broll.MaxEvents {
+			break
+		}
+		if !overlayNear(o, out.Overlays, 1.1) {
+			out.Overlays = append(out.Overlays, o)
+		}
+	}
+	for _, o := range base.Overlays {
+		if len(out.Overlays) >= cfg.Broll.MaxEvents {
+			break
+		}
+		if !overlayNear(o, out.Overlays, 1.1) {
 			out.Overlays = append(out.Overlays, o)
 		}
 	}
 	for _, s := range ai.SFX {
-		if len(out.SFX) >= 3 {
+		if len(out.SFX) >= 4 {
 			break
 		}
-		if !sfxNear(s, out.SFX, .45) {
+		if !sfxNear(s, out.SFX, .35) {
 			out.SFX = append(out.SFX, s)
 		}
 	}
-	for _, e := range ai.Emphasis {
+	for _, s := range base.SFX {
+		if len(out.SFX) >= 4 {
+			break
+		}
+		if !sfxNear(s, out.SFX, .35) {
+			out.SFX = append(out.SFX, s)
+		}
+	}
+	out.Emphasis = append(out.Emphasis, ai.Emphasis...)
+	for _, e := range base.Emphasis {
 		out.Emphasis = appendUnique(out.Emphasis, e)
 	}
 	sanitize(&out, transcribe.Transcript{}, cfg)
@@ -183,7 +218,7 @@ func sanitize(p *Plan, tr transcribe.Transcript, cfg config.Config) {
 		if o.End-o.Start > 3.0 {
 			o.End = o.Start + 3.0
 		}
-		if o.Mode != "bottom" && o.Mode != "fullscreen" && o.Mode != "card" {
+		if o.Mode != "bottom" && o.Mode != "reaction" && o.Mode != "fullscreen" && o.Mode != "card" {
 			o.Mode = "bottom"
 		}
 		if o.Position != "top" && o.Position != "bottom" {
@@ -202,7 +237,7 @@ func sanitize(p *Plan, tr transcribe.Transcript, cfg config.Config) {
 
 	ss := p.SFX[:0]
 	for _, s := range p.SFX {
-		if len(ss) >= 3 {
+		if len(ss) >= 4 {
 			break
 		}
 		if s.Time < 0 || s.Time > maxT {
@@ -223,6 +258,24 @@ func sanitize(p *Plan, tr transcribe.Transcript, cfg config.Config) {
 		ss = append(ss, s)
 	}
 	p.SFX = ss
+}
+
+func compactTranscriptJSON(tr transcribe.Transcript) string {
+	type word struct {
+		T float64 `json:"t"`
+		E float64 `json:"e"`
+		W string  `json:"w"`
+	}
+	words := make([]word, 0, len(tr.Tokens))
+	for _, t := range tr.Tokens {
+		w := strings.TrimSpace(t.Text)
+		if w == "" {
+			continue
+		}
+		words = append(words, word{T: t.Start, E: t.End, W: w})
+	}
+	b, _ := json.Marshal(words)
+	return string(b)
 }
 
 func DebugJSON(p Plan) string { b, _ := json.MarshalIndent(p, "", "  "); return fmt.Sprintf("%s", b) }

@@ -20,12 +20,14 @@ import (
 )
 
 const defaultCommonsAPI = "https://commons.wikimedia.org/w/api.php"
+const maxRemoteAssetBytes int64 = 60 << 20 // 60 MiB keeps local edits responsive.
 
 type Asset struct {
 	Keyword     string `json:"keyword"`
 	Query       string `json:"query,omitempty"`
 	Path        string `json:"path"`
 	Source      string `json:"source"`
+	MediaType   string `json:"media_type,omitempty"` // image | video
 	SourceURL   string `json:"source_url,omitempty"`
 	License     string `json:"license,omitempty"`
 	Author      string `json:"author,omitempty"`
@@ -58,15 +60,15 @@ func New(assetDir, manifestPath, cacheDir string) *Resolver {
 		Manifest: manifestPath,
 		CacheDir: cacheDir,
 		API:      defaultCommonsAPI,
-		Client:   &http.Client{Timeout: 18 * time.Second},
+		Client:   &http.Client{Timeout: 25 * time.Second},
 		Remote:   remote,
 	}
 }
 
-// ResolvePlan resolves each planned overlay to a local file. Resolution order:
-// local manifest -> cache -> Wikimedia Commons. Nothing here requires a paid API.
-// If resolution fails, the overlay remains in the plan with an empty Asset field;
-// the renderer will still create a branded context card so the visual event is not lost.
+// ResolvePlan resolves each planned visual event to a local image/video.
+// Order: local manifest -> cache -> Wikimedia Commons video -> Commons image.
+// No paid API is required. If nothing resolves, the renderer uses an animated
+// self-B-roll fallback rather than a static black card.
 func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Plan, []Asset) {
 	logger := logx.From(ctx)
 	if err := os.MkdirAll(r.CacheDir, 0755); err != nil {
@@ -85,15 +87,17 @@ func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Pla
 		if err != nil {
 			logger.Warn("visual.asset.unresolved", "index", i, "keyword", e.Keyword, "query", query, "error", err)
 			e.Asset = ""
-			e.AssetSource = "generated-card"
+			e.AssetSource = "self-broll"
+			e.AssetType = "video"
 			continue
 		}
 		e.Asset = a.Path
 		e.AssetSource = a.Source
+		e.AssetType = a.MediaType
 		e.SourceURL = a.SourceURL
 		e.Attribution = a.Attribution
 		resolved = append(resolved, a)
-		logger.Info("visual.asset.resolved", "index", i, "keyword", e.Keyword, "source", a.Source, "path", a.Path, "source_url", a.SourceURL, "license", a.License)
+		logger.Info("visual.asset.resolved", "index", i, "keyword", e.Keyword, "source", a.Source, "media_type", a.MediaType, "path", a.Path, "source_url", a.SourceURL, "license", a.License)
 	}
 	return out, resolved
 }
@@ -143,7 +147,7 @@ func (r *Resolver) local(keyword, query string) (Asset, bool) {
 			p = filepath.Join(r.AssetDir, p)
 		}
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return Asset{Keyword: keyword, Query: query, Path: p, Source: "local"}, true
+			return Asset{Keyword: keyword, Query: query, Path: p, Source: "local", MediaType: mediaTypeForPath(p)}, true
 		}
 	}
 	return Asset{}, false
@@ -167,6 +171,9 @@ func (r *Resolver) cached(query string) (Asset, bool) {
 	if _, err := os.Stat(a.Path); err != nil {
 		return Asset{}, false
 	}
+	if a.MediaType == "" {
+		a.MediaType = mediaTypeForPath(a.Path)
+	}
 	a.Source = "cache:" + strings.TrimPrefix(a.Source, "cache:")
 	return a, true
 }
@@ -180,6 +187,7 @@ type commonsResp struct {
 				URL      string `json:"url"`
 				ThumbURL string `json:"thumburl"`
 				Mime     string `json:"mime"`
+				Size     int64  `json:"size"`
 				Ext      map[string]struct {
 					Value string `json:"value"`
 				} `json:"extmetadata"`
@@ -188,18 +196,43 @@ type commonsResp struct {
 	} `json:"query"`
 }
 
+// commons searches moving footage first. This is what turns the visual layer
+// into real B-roll instead of a static illustration. If no usable video is
+// available it falls back to a raster image.
 func (r *Resolver) commons(ctx context.Context, keyword, query string) (Asset, error) {
+	searches := []struct {
+		Q         string
+		WantVideo bool
+	}{
+		{Q: query + " filetype:video", WantVideo: true},
+		{Q: query, WantVideo: false},
+	}
+	var lastErr error
+	for _, s := range searches {
+		a, err := r.commonsSearch(ctx, keyword, query, s.Q, s.WantVideo)
+		if err == nil {
+			return a, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("nenhum B-roll utilizável encontrado")
+	}
+	return Asset{}, lastErr
+}
+
+func (r *Resolver) commonsSearch(ctx context.Context, keyword, cacheQuery, searchQuery string, preferVideo bool) (Asset, error) {
 	u, _ := url.Parse(r.API)
 	q := u.Query()
 	q.Set("action", "query")
 	q.Set("format", "json")
 	q.Set("formatversion", "2")
 	q.Set("generator", "search")
-	q.Set("gsrsearch", query)
+	q.Set("gsrsearch", searchQuery)
 	q.Set("gsrnamespace", "6")
-	q.Set("gsrlimit", "12")
+	q.Set("gsrlimit", "24")
 	q.Set("prop", "imageinfo")
-	q.Set("iiprop", "url|mime|extmetadata")
+	q.Set("iiprop", "url|mime|size|extmetadata")
 	q.Set("iiurlwidth", "1280")
 	u.RawQuery = q.Encode()
 
@@ -207,7 +240,7 @@ func (r *Resolver) commons(ctx context.Context, keyword, query string) (Asset, e
 	if err != nil {
 		return Asset{}, err
 	}
-	req.Header.Set("User-Agent", "CENARIUS-AutoCut/1.4 (local video editor)")
+	req.Header.Set("User-Agent", "CENARIUS-AutoCut/1.5 (local video editor)")
 	resp, err := r.Client.Do(req)
 	if err != nil {
 		return Asset{}, fmt.Errorf("Wikimedia Commons: %w", err)
@@ -217,40 +250,51 @@ func (r *Resolver) commons(ctx context.Context, keyword, query string) (Asset, e
 		return Asset{}, fmt.Errorf("Wikimedia Commons HTTP %s", resp.Status)
 	}
 	var cr commonsResp
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&cr); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 12<<20)).Decode(&cr); err != nil {
 		return Asset{}, err
 	}
 
-	// formatversion=2 returns pages in search relevance order, so keep that order.
-	for _, p := range cr.Query.Pages {
-		if len(p.ImageInfo) == 0 {
-			continue
-		}
-		title := p.Title
-		ii := p.ImageInfo[0]
-		if !supportedMime(ii.Mime) {
-			continue
-		}
-		mediaURL := ii.ThumbURL
-		if mediaURL == "" {
-			mediaURL = ii.URL
-		}
-		if mediaURL == "" {
-			continue
-		}
-		a, err := r.download(ctx, keyword, query, title, mediaURL, ii.Mime, ii.Ext)
-		if err == nil {
-			return a, nil
+	// Pass 1 picks the preferred media kind, pass 2 accepts the other kind.
+	for pass := 0; pass < 2; pass++ {
+		for _, p := range cr.Query.Pages {
+			if len(p.ImageInfo) == 0 {
+				continue
+			}
+			ii := p.ImageInfo[0]
+			isVideo := isVideoMime(ii.Mime)
+			if pass == 0 && isVideo != preferVideo {
+				continue
+			}
+			if pass == 1 && isVideo == preferVideo {
+				continue
+			}
+			if !supportedMime(ii.Mime) {
+				continue
+			}
+			if ii.Size > maxRemoteAssetBytes {
+				continue
+			}
+			mediaURL := ii.URL
+			if !isVideo && ii.ThumbURL != "" {
+				mediaURL = ii.ThumbURL
+			}
+			if mediaURL == "" {
+				continue
+			}
+			a, err := r.download(ctx, keyword, cacheQuery, p.Title, mediaURL, ii.Mime, ii.Ext)
+			if err == nil {
+				return a, nil
+			}
 		}
 	}
-	return Asset{}, fmt.Errorf("nenhuma imagem raster utilizável encontrada no Wikimedia Commons")
+	return Asset{}, fmt.Errorf("nenhum vídeo/imagem utilizável encontrado no Wikimedia Commons para %q", searchQuery)
 }
 
 func (r *Resolver) download(ctx context.Context, keyword, query, title, mediaURL, mimeType string, ext map[string]struct {
 	Value string `json:"value"`
 }) (Asset, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL, nil)
-	req.Header.Set("User-Agent", "CENARIUS-AutoCut/1.4")
+	req.Header.Set("User-Agent", "CENARIUS-AutoCut/1.5")
 	resp, err := r.Client.Do(req)
 	if err != nil {
 		return Asset{}, err
@@ -258,6 +302,9 @@ func (r *Resolver) download(ctx context.Context, keyword, query, title, mediaURL
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		return Asset{}, fmt.Errorf("download asset HTTP %s", resp.Status)
+	}
+	if resp.ContentLength > maxRemoteAssetBytes {
+		return Asset{}, fmt.Errorf("asset remoto grande demais: %d bytes", resp.ContentLength)
 	}
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
@@ -268,7 +315,7 @@ func (r *Resolver) download(ctx context.Context, keyword, query, title, mediaURL
 		extension = extForMime(mimeType)
 	}
 	if extension == "" {
-		return Asset{}, fmt.Errorf("tipo de imagem não suportado: %s", ct)
+		return Asset{}, fmt.Errorf("tipo de mídia não suportado: %s", ct)
 	}
 	base := r.cacheBase(query)
 	path := base + extension
@@ -276,11 +323,15 @@ func (r *Resolver) download(ctx context.Context, keyword, query, title, mediaURL
 	if err != nil {
 		return Asset{}, err
 	}
-	_, copyErr := io.Copy(f, io.LimitReader(resp.Body, 20<<20))
+	n, copyErr := io.Copy(f, io.LimitReader(resp.Body, maxRemoteAssetBytes+1))
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(path)
 		return Asset{}, copyErr
+	}
+	if n > maxRemoteAssetBytes {
+		_ = os.Remove(path)
+		return Asset{}, fmt.Errorf("asset remoto excedeu limite de 60 MiB")
 	}
 	if closeErr != nil {
 		return Asset{}, closeErr
@@ -291,7 +342,7 @@ func (r *Resolver) download(ctx context.Context, keyword, query, title, mediaURL
 	author := stripHTML(meta(ext, "Artist"))
 	credit := stripHTML(meta(ext, "Credit"))
 	attribution := strings.TrimSpace(strings.Join(nonEmpty(author, license, credit), " · "))
-	a := Asset{Keyword: keyword, Query: query, Path: path, Source: "wikimedia-commons", SourceURL: sourcePage, License: license, Author: author, Attribution: attribution}
+	a := Asset{Keyword: keyword, Query: query, Path: path, Source: "wikimedia-commons", MediaType: mediaTypeForPath(path), SourceURL: sourcePage, License: license, Author: author, Attribution: attribution}
 	mb, _ := json.MarshalIndent(a, "", "  ")
 	_ = os.WriteFile(base+".json", mb, 0644)
 	return a, nil
@@ -305,13 +356,29 @@ func WriteAttributions(path string, xs []Asset) error {
 	return os.WriteFile(path, b, 0644)
 }
 
-func normalize(s string) string {
-	return strings.ToLower(strings.TrimSpace(s))
-}
+func normalize(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
 func supportedMime(s string) bool {
 	s = strings.ToLower(strings.TrimSpace(strings.Split(s, ";")[0]))
-	return s == "image/jpeg" || s == "image/png" || s == "image/webp"
+	return s == "image/jpeg" || s == "image/png" || s == "image/webp" ||
+		s == "video/webm" || s == "video/mp4" || s == "video/ogg" || s == "application/ogg"
 }
+
+func isVideoMime(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(strings.Split(s, ";")[0]))
+	return strings.HasPrefix(s, "video/") || s == "application/ogg"
+}
+
+func mediaTypeForPath(p string) string {
+	ext := strings.ToLower(filepath.Ext(p))
+	switch ext {
+	case ".webm", ".mp4", ".m4v", ".mov", ".ogv", ".ogg", ".mpeg", ".mpg":
+		return "video"
+	default:
+		return "image"
+	}
+}
+
 func extForMime(s string) string {
 	s = strings.ToLower(strings.TrimSpace(strings.Split(s, ";")[0]))
 	switch s {
@@ -321,16 +388,24 @@ func extForMime(s string) string {
 		return ".png"
 	case "image/webp":
 		return ".webp"
+	case "video/webm":
+		return ".webm"
+	case "video/mp4":
+		return ".mp4"
+	case "video/ogg", "application/ogg":
+		return ".ogv"
 	}
 	if exts, _ := mime.ExtensionsByType(s); len(exts) > 0 {
 		for _, e := range exts {
-			if e == ".jpg" || e == ".jpeg" || e == ".png" || e == ".webp" {
+			e = strings.ToLower(e)
+			if e == ".jpg" || e == ".jpeg" || e == ".png" || e == ".webp" || e == ".webm" || e == ".mp4" || e == ".ogv" || e == ".ogg" {
 				return e
 			}
 		}
 	}
 	return ""
 }
+
 func meta(m map[string]struct {
 	Value string `json:"value"`
 }, k string) string {
@@ -339,9 +414,8 @@ func meta(m map[string]struct {
 	}
 	return ""
 }
+
 func stripHTML(s string) string {
-	// Commons metadata often contains a small amount of HTML. A complete HTML
-	// renderer is unnecessary for a machine-readable attribution sidecar.
 	var b strings.Builder
 	inTag := false
 	for _, r := range s {
@@ -358,6 +432,7 @@ func stripHTML(s string) string {
 	}
 	return strings.Join(strings.Fields(b.String()), " ")
 }
+
 func nonEmpty(xs ...string) []string {
 	out := make([]string, 0, len(xs))
 	for _, x := range xs {

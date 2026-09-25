@@ -19,6 +19,7 @@ type OverlayEvent struct {
 	AssetSource string  `json:"asset_source,omitempty"`
 	SourceURL   string  `json:"source_url,omitempty"`
 	Attribution string  `json:"attribution,omitempty"`
+	AssetType   string  `json:"asset_type,omitempty"` // image | video
 }
 
 type SFXEvent struct {
