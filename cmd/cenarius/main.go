@@ -68,6 +68,7 @@ func edit(args []string) {
 	}
 	fmt.Printf("\nOK: %s\n", res.Output)
 	fmt.Printf("duração: %.1fs -> %.1fs\n", res.OriginalDuration, res.FinalDuration)
+	fmt.Printf("debug: %s\n", res.DebugLog)
 }
 func hasFFmpegFilter(output, name string) bool {
 	for _, line := range strings.Split(output, "\n") {
@@ -94,12 +95,24 @@ func doctor(args []string) {
 			fmt.Printf("✓ %s\n", x.name)
 		}
 	}
-	if r, err := execx.Run(context.Background(), nil, cfg.FFmpeg, "-hide_banner", "-filters"); err != nil || !hasFFmpegFilter(r.Stdout+r.Stderr, "ass") {
-		fmt.Println("✗ FFmpeg sem filtro ASS/libass; legendas queimadas não funcionarão")
-		fmt.Println("  macOS: rode ./scripts/fix-ffmpeg-macos.sh")
+	if r, err := execx.Run(context.Background(), nil, cfg.FFmpeg, "-hide_banner", "-filters"); err != nil {
+		fmt.Println("✗ não foi possível listar filtros do FFmpeg")
 		bad = true
 	} else {
-		fmt.Println("✓ FFmpeg com ASS/libass")
+		filters := r.Stdout + r.Stderr
+		if !hasFFmpegFilter(filters, "ass") {
+			fmt.Println("✗ FFmpeg sem filtro ASS/libass; legendas queimadas não funcionarão")
+			fmt.Println("  macOS: rode ./scripts/fix-ffmpeg-macos.sh")
+			bad = true
+		} else {
+			fmt.Println("✓ FFmpeg com ASS/libass")
+		}
+		if !hasFFmpegFilter(filters, "drawtext") {
+			fmt.Println("✗ FFmpeg sem drawtext; cards visuais de fallback não funcionarão")
+			bad = true
+		} else {
+			fmt.Println("✓ FFmpeg com drawtext")
+		}
 	}
 	if _, err := os.Stat(cfg.Whisper.Model); err != nil {
 		fmt.Printf("✗ modelo Whisper: %s\n", cfg.Whisper.Model)

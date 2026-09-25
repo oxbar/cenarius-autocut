@@ -17,8 +17,10 @@ var endRE = regexp.MustCompile(`silence_end:\s*([0-9.]+)`)
 
 func Detect(ctx context.Context, ffmpeg, input string, noiseDB int, min float64) ([]Interval, error) {
 	args := []string{"-hide_banner", "-i", input, "-af", fmt.Sprintf("silencedetect=noise=%ddB:d=%.3f", noiseDB, min), "-f", "null", "-"}
-	r, _ := execx.Run(ctx, nil, ffmpeg, args...)
-	// ffmpeg returns success for null output, but even on an error we still parse stderr before returning.
+	r, err := execx.Run(ctx, nil, ffmpeg, args...)
+	if err != nil {
+		return nil, err
+	}
 	ss := startRE.FindAllStringSubmatch(r.Stderr, -1)
 	es := endRE.FindAllStringSubmatch(r.Stderr, -1)
 	n := len(ss)

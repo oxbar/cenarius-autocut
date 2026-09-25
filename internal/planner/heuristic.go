@@ -10,122 +10,186 @@ import (
 	"cenarius-autocut/internal/transcribe"
 )
 
-// Keep heuristic overlays concrete. Generic abbreviations such as "ia" are
-// intentionally omitted here: the old substring matcher saw "ia" inside
-// "tecnologia", "relevância" and "gostaria", creating nonsense overlays.
-var techKeywords = []string{
-	"inteligência artificial", "spring boot", "chatgpt", "openai", "claude", "gemini",
-	"instagram", "youtube", "tiktok", "twitter", "linkedin", "github",
-	"kubernetes", "docker", "java", "spring", "iphone", "apple", "google", "meta",
-	"aws", "azure", "gcp",
+type visualTopic struct {
+	Aliases []string
+	Keyword string
+	Query   string
+	Mode    string
 }
 
-var punchRE = regexp.MustCompile(`(?i)(mas|só que|detalhe|problema|produção|bug|quebrou|erro|ninguém|nunca|sexta-feira|sexta feira|agora|resultado|verdade)`)
+// Queries are intentionally visual and concrete. They are used first against
+// the local asset library and then (free, no API key) against Wikimedia Commons.
+var visualTopics = []visualTopic{
+	{[]string{"inteligência artificial", "inteligencia artificial"}, "inteligência artificial", "artificial intelligence computer technology", "bottom"},
+	{[]string{"chatgpt"}, "chatgpt", "ChatGPT OpenAI", "card"},
+	{[]string{"openai"}, "openai", "OpenAI logo", "card"},
+	{[]string{"claude"}, "claude", "Claude AI Anthropic", "card"},
+	{[]string{"gemini"}, "gemini", "Google Gemini artificial intelligence", "card"},
+	{[]string{"instagram"}, "instagram", "Instagram logo", "card"},
+	{[]string{"youtube"}, "youtube", "YouTube logo", "card"},
+	{[]string{"tiktok"}, "tiktok", "TikTok logo", "card"},
+	{[]string{"twitter", "x"}, "twitter", "X Twitter logo", "card"},
+	{[]string{"linkedin"}, "linkedin", "LinkedIn logo", "card"},
+	{[]string{"github"}, "github", "GitHub logo", "card"},
+	{[]string{"java"}, "java", "Java programming language logo", "card"},
+	{[]string{"spring boot", "spring"}, "spring boot", "Spring Framework Java logo", "card"},
+	{[]string{"docker"}, "docker", "Docker software containers logo", "card"},
+	{[]string{"kubernetes"}, "kubernetes", "Kubernetes logo", "card"},
+	{[]string{"iphone"}, "iphone", "Apple iPhone", "bottom"},
+	{[]string{"apple"}, "apple", "Apple Inc logo", "card"},
+	{[]string{"google"}, "google", "Google logo", "card"},
+	{[]string{"aws"}, "aws", "Amazon Web Services logo", "card"},
+	{[]string{"azure"}, "azure", "Microsoft Azure logo", "card"},
+	{[]string{"gcp"}, "gcp", "Google Cloud logo", "card"},
+	{[]string{"tecnologia", "tecnologias"}, "tecnologia", "computer software technology programming", "bottom"},
+	{[]string{"programação", "programacao", "software", "código", "codigo"}, "programação", "computer programming source code software development", "bottom"},
+}
+
+var punchRE = regexp.MustCompile(`(?i)(mas|só que|so que|detalhe|problema|produção|producao|bug|quebrou|erro|ninguém|ninguem|nunca|sexta-feira|sexta feira|agora|resultado|verdade)`)
 
 func Heuristic(tr transcribe.Transcript, cfg config.Config) Plan {
 	p := Plan{}
-	if len(tr.Segments) == 0 {
+	if len(tr.Segments) == 0 && len(tr.Tokens) == 0 {
 		return p
 	}
 
-	// One subtle hook push-in is enough to establish motion without making the
-	// camera pulse mechanically every 3 seconds.
-	if cfg.Zoom.Enabled {
-		s := tr.Segments[0]
-		end := min(s.End, s.Start+cfg.Zoom.Duration)
-		if end > s.Start+0.25 {
-			p.Zooms = append(p.Zooms, ZoomEvent{Start: s.Start, End: end, Scale: cfg.Zoom.Mild, Reason: "hook"})
-		}
+	maxT := transcriptEnd(tr)
+	if cfg.Zoom.Enabled && maxT > 0.4 {
+		end := min(maxT, cfg.Zoom.Duration)
+		p.Zooms = append(p.Zooms, ZoomEvent{Start: 0, End: end, Scale: cfg.Zoom.Mild, Reason: "hook"})
 	}
 
-	lastZoom := -999.0
-	if len(p.Zooms) > 0 {
-		lastZoom = p.Zooms[len(p.Zooms)-1].Start
-	}
-	lastOverlay := -999.0
-	usedOverlay := map[string]bool{}
-
-	for si, s := range tr.Segments {
-		text := strings.ToLower(strings.TrimSpace(s.Text))
-		if text == "" {
-			continue
-		}
-
-		// B-roll only for a concrete, standalone topic and never repeat the same
-		// topic in the same short. This is deliberately conservative.
-		if cfg.Broll.Enabled && len(p.Overlays) < cfg.Broll.MaxEvents && s.Start-lastOverlay >= 3.5 {
-			if kw := concreteKeyword(text); kw != "" && !usedOverlay[kw] {
-				start := s.Start + 0.15
-				if start >= s.End {
-					start = s.Start
-				}
-				end := min(s.End, start+2.2)
-				if end > start+0.45 {
-					p.Overlays = append(p.Overlays, OverlayEvent{Start: start, End: end, Keyword: kw, Position: "bottom", Reason: "referência visual concreta"})
-					usedOverlay[kw] = true
-					lastOverlay = start
-				}
+	// Whisper commonly returns a whole short as one segment. Plan visual events
+	// from word timestamps instead of relying on segment boundaries.
+	if cfg.Broll.Enabled {
+		hits := topicHits(tr.Tokens)
+		last := -999.0
+		used := map[string]bool{}
+		for _, h := range hits {
+			if len(p.Overlays) >= cfg.Broll.MaxEvents {
+				break
 			}
+			if used[h.Topic.Keyword] || h.Start-last < 3.2 {
+				continue
+			}
+			start := max(0, h.Start-0.08)
+			end := min(maxT, start+2.15)
+			if end-start < 0.7 {
+				continue
+			}
+			mode := h.Topic.Mode
+			if mode == "" {
+				mode = "bottom"
+			}
+			p.Overlays = append(p.Overlays, OverlayEvent{
+				Start: start, End: end, Keyword: h.Topic.Keyword, Query: h.Topic.Query,
+				Position: "bottom", Mode: mode, Reason: "referência visual concreta",
+			})
+			// A subtle pop gives the visual insertion a deliberate edit feel.
+			p.SFX = append(p.SFX, SFXEvent{Time: start, Name: "pop", GainDB: -22, Reason: "entrada de elemento visual"})
+			used[h.Topic.Keyword] = true
+			last = start
 		}
+	}
 
-		// Punch-ins happen on actual emphasis or a new idea boundary, not on a
-		// metronome. Avoid colliding with a B-roll event.
-		if cfg.Zoom.Enabled && si > 0 && s.Start-lastZoom >= cfg.Zoom.MinGap && !nearOverlay(s.Start, p.Overlays) {
-			scale := 0.0
-			reason := ""
-			if punchRE.MatchString(s.Text) || strings.ContainsAny(s.Text, "!?") {
+	// Sentence starts are natural cut/reframe points. This works even when
+	// Whisper produced only one large segment.
+	if cfg.Zoom.Enabled {
+		lastZoom := 0.0
+		for i := 1; i < len(tr.Tokens); i++ {
+			prev := tr.Tokens[i-1]
+			cur := tr.Tokens[i]
+			if !strings.ContainsAny(prev.Text, ".!?") {
+				continue
+			}
+			if cur.Start-lastZoom < cfg.Zoom.MinGap || nearOverlay(cur.Start, p.Overlays) {
+				continue
+			}
+			scale := cfg.Zoom.Mild
+			reason := "mudança de ideia"
+			if punchRE.MatchString(cur.Text) || strings.ContainsAny(prev.Text, "!?") {
 				scale = cfg.Zoom.Punch
 				reason = "ênfase/punchline"
-			} else if s.Start >= 7.0 && len([]rune(strings.TrimSpace(s.Text))) >= 28 {
-				scale = cfg.Zoom.Mild
-				reason = "mudança de ideia"
 			}
-			if scale > 0 {
-				end := min(s.End, s.Start+cfg.Zoom.Duration)
-				if end > s.Start+0.25 {
-					p.Zooms = append(p.Zooms, ZoomEvent{Start: s.Start, End: end, Scale: scale, Reason: reason})
-					lastZoom = s.Start
-				}
+			end := min(maxT, cur.Start+cfg.Zoom.Duration)
+			if end-cur.Start > 0.25 {
+				p.Zooms = append(p.Zooms, ZoomEvent{Start: cur.Start, End: end, Scale: scale, Reason: reason})
+				lastZoom = cur.Start
 			}
 		}
+	}
 
+	for _, s := range tr.Segments {
 		if punchRE.MatchString(s.Text) {
 			if w := emphasisWord(s.Text); w != "" {
 				p.Emphasis = appendUnique(p.Emphasis, w)
 			}
 		}
 	}
+
 	sort.Slice(p.Zooms, func(i, j int) bool { return p.Zooms[i].Start < p.Zooms[j].Start })
+	sort.Slice(p.Overlays, func(i, j int) bool { return p.Overlays[i].Start < p.Overlays[j].Start })
+	sort.Slice(p.SFX, func(i, j int) bool { return p.SFX[i].Time < p.SFX[j].Time })
 	return p
 }
 
-func concreteKeyword(text string) string {
-	for _, kw := range techKeywords {
-		if matchKeyword(text, kw) {
-			return kw
-		}
-	}
-	return ""
+type topicHit struct {
+	Start float64
+	Topic visualTopic
 }
 
-func matchKeyword(text, kw string) bool {
-	text = strings.ToLower(text)
-	kw = strings.ToLower(strings.TrimSpace(kw))
-	if kw == "" {
-		return false
+func topicHits(tokens []transcribe.Token) []topicHit {
+	if len(tokens) == 0 {
+		return nil
 	}
-	if strings.Contains(kw, " ") {
-		return strings.Contains(text, kw)
+	words := make([]string, len(tokens))
+	for i, t := range tokens {
+		words[i] = normalizeWord(t.Text)
 	}
-	words := strings.FieldsFunc(text, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsNumber(r) && r != '_'
-	})
-	for _, w := range words {
-		if w == kw {
-			return true
+	var out []topicHit
+	for i := range words {
+		for _, topic := range visualTopics {
+			for _, alias := range topic.Aliases {
+				parts := strings.Fields(normalizeWord(alias))
+				if len(parts) == 0 || i+len(parts) > len(words) {
+					continue
+				}
+				ok := true
+				for j, part := range parts {
+					if words[i+j] != part {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					out = append(out, topicHit{Start: tokens[i].Start, Topic: topic})
+				}
+			}
 		}
 	}
-	return false
+	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+	return out
+}
+
+func normalizeWord(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimFunc(s, func(r rune) bool { return unicode.IsPunct(r) || unicode.IsSymbol(r) })
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func transcriptEnd(tr transcribe.Transcript) float64 {
+	maxT := 0.0
+	for _, s := range tr.Segments {
+		if s.End > maxT {
+			maxT = s.End
+		}
+	}
+	for _, t := range tr.Tokens {
+		if t.End > maxT {
+			maxT = t.End
+		}
+	}
+	return maxT
 }
 
 func nearOverlay(t float64, os []OverlayEvent) bool {
@@ -161,4 +225,34 @@ func min(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+func max(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// matchKeyword is kept for backwards compatibility with tests and helpers.
+// Matching is word/phrase based; it never treats "ia" as a substring of
+// "tecnologia" or "gostaria".
+func matchKeyword(text, kw string) bool {
+	textWords := strings.Fields(normalizeWord(text))
+	kwWords := strings.Fields(normalizeWord(kw))
+	if len(kwWords) == 0 || len(textWords) < len(kwWords) {
+		return false
+	}
+	for i := 0; i+len(kwWords) <= len(textWords); i++ {
+		ok := true
+		for j := range kwWords {
+			if textWords[i+j] != kwWords[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
