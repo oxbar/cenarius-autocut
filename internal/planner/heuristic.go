@@ -285,9 +285,12 @@ func PlanZooms(units []SemanticUnit, events []VisualEvent, dur float64, cfg conf
 			break
 		}
 	}
-	limit := int(math.Max(3, math.Ceil(dur/5)))
-	if limit > 6 {
+	limit := int(math.Max(3, math.Ceil(dur/10)+2))
+	if dur <= 30 && limit > 6 {
 		limit = 6
+	}
+	if dur > 30 && limit > 10 {
+		limit = 10
 	}
 	sort.Slice(zs, func(i, j int) bool { return zs[i].Start < zs[j].Start })
 	if len(zs) > limit {

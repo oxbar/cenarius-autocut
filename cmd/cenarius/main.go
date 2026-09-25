@@ -32,6 +32,10 @@ func main() {
 	}
 }
 func load(path string) config.Config {
+	// Optional local secrets. Existing shell environment wins over .env.
+	if err := config.LoadEnvFile(filepath.Join(filepath.Dir(path), ".env")); err != nil {
+		fatal(err)
+	}
 	cfg, err := config.Load(path)
 	if err != nil {
 		fatal(err)

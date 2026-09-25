@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CENARIUS AutoCut v1.6 visual smoke test.
+# CENARIUS AutoCut v1.7 visual smoke test.
 # Runs the full pipeline (probe -> audio -> whisper stub -> semantic planner ->
 # asset resolver -> render) offline and checks that the output really is a
 # smart edit: A-roll + captions + zoom + video B-roll + Ken Burns still +
@@ -43,12 +43,12 @@ cat > "$TMP/manifest.json" <<JSON
 ]}
 JSON
 
-# 23.085 s portrait source at 24 fps: same shape as the real IMG_6823.MOV test
-# clip. Output is 30 fps; the duration must not change (the old zoompan bug
-# turned ~23 s into ~18 s).
+# 13.95 s portrait source at 24 fps. It is long enough to exercise three
+# distinct visual events, a punchline zoom and SFX while keeping CI smoke
+# fast. Output is 30 fps and the duration must not change.
 "$FFMPEG_BIN" -hide_banner -loglevel error -y \
-  -f lavfi -i "testsrc2=size=720x1280:rate=24:duration=23.085" \
-  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=23.085" \
+  -f lavfi -i "testsrc2=size=720x1280:rate=24:duration=13.95" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=13.95" \
   -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$TMP/input.mp4"
 
 cat > "$TMP/bin/whisper-cli" <<'STUB'
@@ -69,9 +69,9 @@ cat > "$TMP/config.json" <<JSON
   "ffprobe": "$FFPROBE_BIN",
   "whisper": {"binary":"$TMP/bin/whisper-cli","model":"$TMP/models/fake.bin","language":"pt","threads":0},
   "ollama": {"enabled":false,"url":"http://127.0.0.1:11434","model":"qwen3:8b"},
-  "output": {"width":1080,"height":1920,"fps":30,"crf":20,"preset":"veryfast","audio_bitrate":"192k"},
+  "output": {"width":1080,"height":1920,"fps":30,"crf":20,"preset":"ultrafast","audio_bitrate":"192k"},
   "cuts": {"enabled":false,"noise_db":-35,"min_silence":0.85,"keep_silence":0.18,"min_keep_segment":0.15},
-  "captions": {"enabled":true,"font_name":"Arial","font_size":82,"primary_color":"&H00FFFFFF","highlight_color":"&H0000D7FF","outline_color":"&H00000000","outline":6,"shadow":0,"margin_v":560,"max_words":6,"uppercase":true,"active_word":true},
+  "captions": {"enabled":true,"font_name":"Arial","font_size":74,"primary_color":"&H00FFFFFF","highlight_color":"&H0000D7FF","outline_color":"&H00000000","outline":5,"shadow":0,"margin_v":560,"safe_margin":112,"max_words":6,"max_chars_per_line":22,"uppercase":true,"active_word":true,"timing_offset":0.06,"active_scale":1.05,"max_width_ratio":0.80},
   "zoom": {"enabled":true,"mild":1.06,"emphasis":1.085,"punch":1.10,"min_gap":3.0,"duration":0.85},
   "broll": {"enabled":true,"asset_dir":"$TMP/assets","manifest":"$TMP/manifest.json","max_events":5,
             "min_visual_gap":0.35,"remote":false,"procedural":true,"allow_self_broll":true}

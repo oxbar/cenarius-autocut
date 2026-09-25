@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
 
 // MinEventDuration is the shortest visual event worth showing; anything
@@ -125,18 +126,40 @@ func FindOverlaps(events []VisualEvent, gap float64) [][2]string {
 	return out
 }
 
-// TargetVisualEvents is the rhythm budget: ~3-6 relevant visual changes for a
-// 20-30 s short (inserts + zooms), never a wall of 15 effects.
+// TargetVisualEvents is the B-roll/cutaway budget. Shorts stay around 3-5
+// inserts; medium/long videos scale gradually instead of being hard-capped at
+// five events for the entire timeline. maxEvents remains the user safety cap.
 func TargetVisualEvents(duration float64, maxEvents int) int {
-	n := int(math.Round(duration / 6.0))
-	if n < 1 && duration >= 4 {
-		n = 1
+	if duration < 4 {
+		return 0
 	}
-	if n < 2 && duration >= 9 {
-		n = 2
-	}
-	if n > 5 {
-		n = 5
+	var n int
+	if duration <= 30 {
+		n = int(math.Round(duration / 6.0))
+		if n < 1 {
+			n = 1
+		}
+		if n < 2 && duration >= 9 {
+			n = 2
+		}
+		// Once a Short has enough timeline to breathe, three meaningful
+		// visual changes is a better retention floor than two long static runs.
+		if n < 3 && duration >= 12 {
+			n = 3
+		}
+		if n > 5 {
+			n = 5
+		}
+	} else {
+		// Roughly one meaningful insert every 7.5 seconds, with enough A-roll
+		// breathing room for captions/zooms between them.
+		n = int(math.Round(duration / 7.5))
+		if n < 5 {
+			n = 5
+		}
+		if n > 12 {
+			n = 12
+		}
 	}
 	if maxEvents > 0 && n > maxEvents {
 		n = maxEvents
@@ -145,6 +168,10 @@ func TargetVisualEvents(duration float64, maxEvents int) int {
 }
 
 // Schedule resolves conflicts, applies the rhythm budget and assigns stable IDs.
+func normalizeConcept(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
 func Schedule(events []VisualEvent, duration, minGap float64, maxEvents int) ([]VisualEvent, []Conflict) {
 	for i := range events {
 		if events[i].ID == "" {
@@ -153,12 +180,49 @@ func Schedule(events []VisualEvent, duration, minGap float64, maxEvents int) ([]
 	}
 	accepted, conflicts := ResolveVisualConflicts(events, minGap)
 	budget := TargetVisualEvents(duration, maxEvents)
-	if len(accepted) > budget {
-		sort.SliceStable(accepted, func(i, j int) bool { return eventScore(accepted[i]) > eventScore(accepted[j]) })
-		for _, e := range accepted[budget:] {
+	if budget == 0 {
+		for _, e := range accepted {
 			conflicts = append(conflicts, Conflict{Loser: e.ID, Action: "dropped_rhythm_budget"})
 		}
-		accepted = accepted[:budget]
+		accepted = nil
+	} else if len(accepted) > budget {
+		ranked := append([]VisualEvent(nil), accepted...)
+		sort.SliceStable(ranked, func(i, j int) bool { return eventScore(ranked[i]) > eventScore(ranked[j]) })
+		chosen := make([]VisualEvent, 0, budget)
+		chosenID := map[string]bool{}
+		concepts := map[string]bool{}
+		// First pass prioritises distinct concepts. A second pass fills spare
+		// budget only when the transcript genuinely has fewer alternatives.
+		for _, e := range ranked {
+			key := normalizeConcept(e.Concept)
+			if key != "" && concepts[key] {
+				continue
+			}
+			chosen = append(chosen, e)
+			chosenID[e.ID] = true
+			if key != "" {
+				concepts[key] = true
+			}
+			if len(chosen) == budget {
+				break
+			}
+		}
+		for _, e := range ranked {
+			if len(chosen) == budget {
+				break
+			}
+			if chosenID[e.ID] {
+				continue
+			}
+			chosen = append(chosen, e)
+			chosenID[e.ID] = true
+		}
+		for _, e := range accepted {
+			if !chosenID[e.ID] {
+				conflicts = append(conflicts, Conflict{Loser: e.ID, Action: "dropped_rhythm_budget"})
+			}
+		}
+		accepted = chosen
 		sort.Slice(accepted, func(i, j int) bool { return accepted[i].Start < accepted[j].Start })
 	}
 	for i := range accepted {

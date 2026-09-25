@@ -439,3 +439,184 @@ func TestProceduralWithoutTextFiltersFailsClearly(t *testing.T) {
 		t.Fatalf("want actionable error, got %v", err)
 	}
 }
+
+type stubValidator struct {
+	media Media
+}
+
+func (v stubValidator) Validate(ctx context.Context, path, kind string) (Media, error) {
+	m := v.media
+	if m.Type == "" {
+		m.Type = kind
+	}
+	if m.Width == 0 {
+		m.Width = 1080
+	}
+	if m.Height == 0 {
+		m.Height = 1920
+	}
+	if kind == "video" && m.Duration == 0 {
+		m.Duration = 8
+	}
+	return m, nil
+}
+
+func TestPexelsPreferredBeforePixabayAndSecretsStayOutOfLog(t *testing.T) {
+	var pixabayCalls int32
+	secret := "pexels-super-secret-key"
+	media := bytes.Repeat([]byte{0x42}, 1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/pexels/videos/search":
+			if got := r.Header.Get("Authorization"); got != secret {
+				t.Errorf("missing pexels auth header: %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"videos":[{"id":7,"width":1080,"height":1920,"url":"https://www.pexels.com/video/7/","duration":8,"user":{"name":"Creator"},"video_files":[{"quality":"hd","file_type":"video/mp4","width":1080,"height":1920,"link":"` + "http://" + strings.TrimPrefix(r.Host, "") + `/media/pexels.mp4"}]}]}`))
+		case r.URL.Path == "/pixabay/api/videos/":
+			atomic.AddInt32(&pixabayCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"hits":[]}`))
+		case r.URL.Path == "/media/pexels.mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write(media)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	ctx, logPath, closer, err := logx.StartJob(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(filepath.Join(dir, "assets"), filepath.Join(dir, "none.json"), filepath.Join(dir, "cache"))
+	r.Client = srv.Client()
+	r.PexelsAPI = srv.URL + "/pexels"
+	r.PixabayAPI = srv.URL + "/pixabay/api"
+	r.PexelsKey = secret
+	r.PixabayKey = "pixabay-secret"
+	r.API = srv.URL + "/commons"
+	r.Validator = stubValidator{media: Media{Type: "video", Width: 1080, Height: 1920, Duration: 8}}
+	r.Procedural, r.AllowSelfBroll = false, false
+	ev := planner.VisualEvent{ID: "ve-001", Concept: "software development", Queries: []string{"programmer coding"}, Layout: planner.LayoutReaction}
+	ref, a, err := r.ResolveEvent(ctx, ev)
+	closer.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Source != SourcePexels || a == nil || a.License != "Pexels License" {
+		t.Fatalf("expected Pexels, got ref=%+v asset=%+v", ref, a)
+	}
+	if atomic.LoadInt32(&pixabayCalls) != 0 {
+		t.Fatalf("Pixabay should not be queried after Pexels success")
+	}
+	b, _ := os.ReadFile(logPath)
+	if bytes.Contains(b, []byte(secret)) || bytes.Contains(b, []byte("pixabay-secret")) {
+		t.Fatalf("API key leaked to debug.log:\n%s", b)
+	}
+}
+
+func TestProviderFallbackPexelsToPixabay(t *testing.T) {
+	media := bytes.Repeat([]byte{0x24}, 1024)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/pexels/videos/search":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"videos":[]}`))
+		case "/pixabay/api/videos/":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"hits":[{"id":9,"pageURL":"https://pixabay.com/videos/id-9/","duration":7,"user":"PixUser","tags":"programming, code","videos":{"medium":{"url":"` + srv.URL + `/media/pixabay.mp4","width":1080,"height":1920,"size":1024}}}]}`))
+		case "/media/pixabay.mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write(media)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	d := t.TempDir()
+	r := New(filepath.Join(d, "assets"), filepath.Join(d, "none.json"), filepath.Join(d, "cache"))
+	r.Client = srv.Client()
+	r.PexelsAPI = srv.URL + "/pexels"
+	r.PixabayAPI = srv.URL + "/pixabay/api"
+	r.PexelsKey = "pexels-key"
+	r.PixabayKey = "pixabay-key"
+	r.API = srv.URL + "/commons"
+	r.Validator = stubValidator{media: Media{Type: "video", Width: 1080, Height: 1920, Duration: 7}}
+	r.Procedural, r.AllowSelfBroll = false, false
+	ref, a, err := r.ResolveEvent(context.Background(), planner.VisualEvent{ID: "ve-001", Concept: "software development", Queries: []string{"programmer coding"}, Layout: planner.LayoutReaction})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Source != SourcePixabay || a == nil || a.License != "Pixabay Content License" {
+		t.Fatalf("expected Pixabay fallback, got ref=%+v asset=%+v", ref, a)
+	}
+}
+
+func TestResolvePlanDoesNotReuseSameLocalAssetWhenAlternativeExists(t *testing.T) {
+	d := t.TempDir()
+	assetDir := filepath.Join(d, "assets")
+	if err := os.MkdirAll(assetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"one.png", "two.png"} {
+		if err := os.WriteFile(filepath.Join(assetDir, name), realPNG(t, 640, 960), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := filepath.Join(d, "manifest.json")
+	if err := os.WriteFile(manifest, []byte(`{"assets":[
+		{"keyword":"programacao","concepts":["software development"],"file":"one.png","license":"CC0"},
+		{"keyword":"programacao","concepts":["software development"],"file":"two.png","license":"CC0"}
+	]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := New(assetDir, manifest, filepath.Join(d, "cache"))
+	r.Remote, r.Procedural, r.AllowSelfBroll = false, false, false
+	p := planner.Plan{VisualEvents: []planner.VisualEvent{
+		{ID: "ve-001", Concept: "software development", Queries: []string{"programacao"}, Start: 2, End: 4, Layout: planner.LayoutReaction},
+		{ID: "ve-002", Concept: "software development", Queries: []string{"programacao"}, Start: 7, End: 9, Layout: planner.LayoutReaction},
+	}}
+	out, _ := r.ResolvePlan(context.Background(), p)
+	if len(out.VisualEvents) != 2 {
+		t.Fatalf("expected both events resolved, got %+v", out.VisualEvents)
+	}
+	if out.VisualEvents[0].Asset.Path == out.VisualEvents[1].Asset.Path {
+		t.Fatalf("same local asset reused: %s", out.VisualEvents[0].Asset.Path)
+	}
+}
+
+func TestStockShapeScorePrefersVerticalShortsMedia(t *testing.T) {
+	vertical := stockShapeScore(1080, 1920, 8)
+	horizontal := stockShapeScore(1920, 1080, 8)
+	if vertical <= horizontal {
+		t.Fatalf("vertical score=%v must beat horizontal score=%v", vertical, horizontal)
+	}
+}
+
+func TestWriteAttributionsPreservesProviderMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "assets-attribution.json")
+	want := Asset{
+		EventID: "ve-001", Keyword: "software development", Query: "programmer coding",
+		Path: "/tmp/clip.mp4", Source: SourcePexels, MediaType: "video",
+		URL: "https://cdn.example/clip.mp4", SourceURL: "https://www.pexels.com/video/7/",
+		License: "Pexels License", Author: "Creator", Attribution: "Pexels",
+	}
+	if err := WriteAttributions(path, []Asset{want}); err != nil {
+		t.Fatal(err)
+	}
+	var got []Asset
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Source != SourcePexels || got[0].License != want.License || got[0].Author != want.Author || got[0].SourceURL != want.SourceURL {
+		t.Fatalf("attribution metadata lost: %+v", got)
+	}
+}

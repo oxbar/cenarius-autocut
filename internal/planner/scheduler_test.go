@@ -266,3 +266,41 @@ func TestLongestAliasWins(t *testing.T) {
 		t.Fatalf("%+v", units[0].Concepts)
 	}
 }
+
+func TestShortFormVisualBudgetKeepsThreeChangesWhenThereIsRoom(t *testing.T) {
+	if got := TargetVisualEvents(13.9, 12); got != 3 {
+		t.Fatalf("13.9s short should budget 3 visual changes, got %d", got)
+	}
+}
+
+func TestLongFormVisualBudgetScalesWithDuration(t *testing.T) {
+	short := TargetVisualEvents(25, 12)
+	long := TargetVisualEvents(88, 12)
+	if short < 3 || short > 5 {
+		t.Fatalf("25s short budget should stay 3-5, got %d", short)
+	}
+	if long < 10 || long > 12 {
+		t.Fatalf("88s budget should scale to 10-12, got %d", long)
+	}
+}
+
+func TestRhythmBudgetPrefersDistinctConcepts(t *testing.T) {
+	events := []VisualEvent{
+		{ID: "a1", Start: 2, End: 3.2, Concept: "software", Importance: .99, Relevance: .99},
+		{ID: "a2", Start: 5, End: 6.2, Concept: "software", Importance: .98, Relevance: .98},
+		{ID: "b", Start: 8, End: 9.2, Concept: "github", Importance: .80, Relevance: .80},
+		{ID: "c", Start: 11, End: 12.2, Concept: "docker", Importance: .79, Relevance: .79},
+		{ID: "d", Start: 14, End: 15.2, Concept: "kubernetes", Importance: .78, Relevance: .78},
+	}
+	out, _ := Schedule(events, 20, .35, 3)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 events, got %+v", out)
+	}
+	seen := map[string]bool{}
+	for _, e := range out {
+		if seen[e.Concept] {
+			t.Fatalf("budget reused concept despite alternatives: %+v", out)
+		}
+		seen[e.Concept] = true
+	}
+}

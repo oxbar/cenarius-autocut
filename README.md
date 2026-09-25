@@ -1,6 +1,6 @@
 # CENARIUS AutoCut
 
-Editor local para Shorts/Reels/TikTok feito em Go. A V1 automatiza **cortes de silêncio, transcrição offline, legendas ASS grandes, zooms editoriais, normalização de áudio, B-roll local por palavra-chave e render 9:16**. Opcionalmente usa Ollama para melhorar o plano de edição sem API paga.
+Editor local para Shorts/Reels/TikTok feito em Go. A V1 automatiza **cortes de silêncio, transcrição offline, legendas ASS refinadas, zooms editoriais, normalização de áudio, B-roll contextual e render 9:16**. Opcionalmente usa Ollama para melhorar o plano de edição sem API paga.
 
 ## Por que Go
 
@@ -63,17 +63,17 @@ Em `config.json`:
 
 Se Ollama estiver indisponível ou responder JSON inválido, o sistema volta automaticamente ao planner heurístico.
 
-## Editor inteligente (v1.6)
+## Editor inteligente (v1.7)
 
 O pipeline agora trabalha como um editor/diretor, não como detector de palavras:
 
 1. **Unidades semânticas** (`internal/planner/semantic.go`): a fala é quebrada em frases/respirações e cada uma recebe um papel — `hook`, `explanation`, `example`, `punchline`, `turn` (mudança de ideia), `question`, `cta` — e os conceitos citados (léxico em `concepts.go`, cada conceito com 3–4 queries em inglês).
 2. **Diretor editorial** (Ollama/Qwen, opcional): recebe unidades + palavras com timestamps e devolve JSON estrito (`visual_events`, `zooms`, `emphasis`). O Go valida tudo; JSON inválido ou Ollama offline → fallback heurístico, sem interromper o pipeline.
-3. **Scheduler visual** (`scheduler.go`): `ResolveVisualConflicts` remove sobreposições (importância, relevância, qualidade da fonte), respeita `broll.min_visual_gap` e um orçamento de ritmo (3–5 inserts em 20–30 s). Nada de B-roll antes de 1.2 s: o primeiro segundo é do creator com punch zoom.
+3. **Scheduler visual** (`scheduler.go`): `ResolveVisualConflicts` remove sobreposições (importância, relevância, qualidade da fonte), respeita `broll.min_visual_gap` e um orçamento de ritmo proporcional: 3–5 inserts em 20–30 s e crescimento gradual em vídeos maiores (até 12 por padrão). O orçamento também prioriza conceitos diferentes quando há alternativas. Nada de B-roll antes de 1.2 s: o primeiro segundo é do creator com punch zoom.
 4. **Zooms por intenção**: `punch_zoom` (hook/punchline, 1.08–1.12), `reframe` (mudança de ideia), `slow_push` (A-roll longo, 1.055–1.07).
 5. **AssetResolver** (`internal/assets`), nesta ordem:
-   local (`assets/manifest.json`) → cache (`data/asset-cache`) → **vídeo** do Wikimedia Commons → imagem do Commons → motion graphic procedural (FFmpeg) → self-broll (último recurso, registrado como `WARN`).
-   Várias queries por evento; licença verificada (CC0/PD/CC BY/CC BY-SA; NC/ND/desconhecida rejeitadas); todo arquivo é validado (ffprobe + decode de 1 frame para vídeo, decoder para imagem); HTML/erro/arquivo truncado → próximo candidato. Créditos em `assets-attribution.json`.
+   local (`assets/manifest.json`) → cache (`data/asset-cache`) → **Pexels vídeo** → **Pixabay vídeo** → **Pexels imagem** → **Pixabay imagem** → Wikimedia Commons vídeo → Commons imagem → motion graphic procedural (FFmpeg) → self-broll (último recurso, registrado como `WARN`).
+   Várias queries por evento; vídeo e orientação vertical recebem preferência; o mesmo arquivo não é reutilizado no mesmo render quando existe alternativa. Commons mantém validação de licença livre (CC0/PD/CC BY/CC BY-SA; NC/ND/desconhecida rejeitadas); Pexels/Pixabay são registrados com suas licenças de conteúdo e página de origem. Todo arquivo é validado (ffprobe + decode de 1 frame para vídeo, decoder para imagem); HTML/erro/arquivo truncado → próximo candidato. Créditos em `assets-attribution.json`.
 6. **Layouts**: `reaction` (creator em cima, B-roll embaixo, legenda na costura), `fullscreen` (cutaway curto), `card` (print/logo com cantos arredondados, sombra e entrada suave sobre painel escuro), `pip`. Vídeo é preferido; imagem recebe Ken Burns discreto. B-roll nunca leva áudio e a legenda é queimada por último (nunca fica coberta).
 7. **SFX discretos** (whoosh/pop/click/beep, −28 a −18 dB), nunca em todos os inserts.
 
@@ -90,11 +90,23 @@ Vídeos (`.mp4`, `.webm`, `.mov`) e imagens (`.png`, `.jpg`, `.webp`) são aceit
 ### Configuração nova (`broll`)
 
 - `min_visual_gap`: respiro mínimo de A-roll entre inserts (0.35 s)
-- `remote`: busca gratuita no Wikimedia Commons (`CENARIUS_NO_REMOTE_ASSETS=1` também desliga)
+- `remote`: habilita busca remota; tenta Pexels/Pixabay quando as chaves existem e Wikimedia Commons como fonte sem chave (`CENARIUS_NO_REMOTE_ASSETS=1` desliga tudo)
 - `procedural` / `allow_self_broll`: fallbacks
 - `reaction_split` / `reaction_focus_y`: altura da divisão e posição do rosto no A-roll
 - `seam_captions`: move a legenda para a costura durante split/card
 - `CENARIUS_BOLD_FONT=/caminho/fonte.ttf`: fonte pesada dos motion graphics
+
+### Pexels / Pixabay (opcional)
+
+Copie `.env.example` para `.env` e preencha somente localmente:
+
+```bash
+cp .env.example .env
+# PEXELS_API_KEY=...
+# PIXABAY_API_KEY=...
+```
+
+`.env` está no `.gitignore`. Variáveis já exportadas no shell têm precedência; nenhuma chave entra em `config.json`, `edit-plan.json` ou `debug.log`. Sem chaves, o resolver continua usando local/cache/Wikimedia/fallbacks.
 
 FFmpeg: use o `ffmpeg-full` (libass + drawtext). O `ffmpeg` padrão do Homebrew não tem `drawtext`; nesse caso os motion graphics usam libass e o self-broll fica sem rótulo. Os testes escolhem `FFMPEG_BIN`/`FFPROBE_BIN`, depois `ffmpeg-full` do Homebrew, depois o PATH.
 
@@ -104,20 +116,22 @@ Tudo fica em `config.json`:
 - `cuts.min_silence`: silêncio mínimo para cortar
 - `cuts.keep_silence`: quanto de pausa manter
 - `captions.max_words`: palavras por bloco
-- `captions.font_size`, cores e margem vertical
+- `captions.font_size`, `safe_margin`, `max_width_ratio`, cores e margem vertical
+- `captions.timing_offset`: atraso positivo pequeno (default 0.06 s) para evitar legenda visualmente adiantada
+- `captions.active_scale`: escala da palavra ativa (default 1.05)
 - `zoom.mild` / `zoom.emphasis` / `zoom.punch` (1.035 é praticamente invisível; use 1.055+)
 - `output.crf`: qualidade H.264 (menor = melhor/maior arquivo)
 
 ## Limitações honestas da V1
 
-- A cobertura de vídeo livre no Wikimedia Commons é limitada; para temas de nicho, a biblioteca local faz muita diferença.
+- Sem chaves de Pexels/Pixabay, a cobertura remota depende do Wikimedia Commons; para temas de nicho, a biblioteca local continua fazendo muita diferença.
 - Sem Ollama, conceitos vêm de um léxico (roles e contexto são heurísticos).
 - O reenquadramento usa `reaction_focus_y` fixo (sem face tracking).
 - A revisão humana continua recomendada antes de publicar.
 
 ## Próximas etapas
 
-V2: preview de timeline e aceitar/remover B-roll antes do render; busca em Wikimedia/Pexels com licença; face tracking; cards de screenshots; templates `Commentary`, `Reaction`, `Meme`.
+V2: preview de timeline e aceitar/remover B-roll antes do render; face tracking; captura automatizada de screenshots/interfaces; templates `Commentary`, `Reaction`, `Meme`.
 
 ## Segurança
 

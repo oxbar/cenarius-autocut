@@ -316,9 +316,9 @@ func transcodeGuesses(orig string) []string {
 
 // download fetches one URL into the cache and validates it. A non-2xx status,
 // an HTML body or an undecodable file is rejected.
-func (r *Resolver) download(ctx context.Context, rawURL, kind string) (string, Media, error) {
+func (r *Resolver) download(ctx context.Context, source, rawURL, kind string) (string, Media, error) {
 	logger := logx.From(ctx)
-	if p, ok := r.cache.FindByURL(SourceCommons, rawURL); ok {
+	if p, ok := r.cache.FindByURL(source, rawURL); ok {
 		m, err := r.Validator.Validate(ctx, p, kind)
 		if err == nil {
 			logger.Info("visual.asset.cache_hit", "level", "media", "url", rawURL, "path", p)
@@ -354,7 +354,7 @@ func (r *Resolver) download(ctx context.Context, rawURL, kind string) (string, M
 	if ext == "" {
 		ext = map[string]string{"video": ".webm", "image": ".jpg"}[kind]
 	}
-	final := r.cache.MediaPath(SourceCommons, rawURL, ext)
+	final := r.cache.MediaPath(source, rawURL, ext)
 	tmp := final + ".part"
 	f, err := os.Create(tmp)
 	if err != nil {

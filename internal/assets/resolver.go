@@ -21,6 +21,8 @@ import (
 const (
 	SourceLocal     = planner.SourceLocal
 	SourceCache     = planner.SourceCache
+	SourcePexels    = planner.SourcePexels
+	SourcePixabay   = planner.SourcePixabay
 	SourceCommons   = planner.SourceCommons
 	SourceProcedure = planner.SourceProcedure
 	SourceSelfBroll = planner.SourceSelfBroll
@@ -65,15 +67,22 @@ type manifest struct {
 //
 //  1. local asset library (assets/manifest.json)
 //  2. cache (data/asset-cache)
-//  3. real video from a free source (Wikimedia Commons)
-//  4. real image from a free source
-//  5. procedural motion graphic (FFmpeg)
-//  6. self-broll — last fallback only, never counted as success
+//  3. Pexels video
+//  4. Pixabay video
+//  5. Pexels image
+//  6. Pixabay image
+//  7. Wikimedia Commons (video, then image)
+//  8. procedural motion graphic (FFmpeg)
+//  9. self-broll — last fallback only, never counted as success
 type Resolver struct {
 	AssetDir       string
 	Manifest       string
 	CacheDir       string
-	API            string
+	API            string // Wikimedia Commons API (kept for backwards-compatible tests)
+	PexelsAPI      string
+	PixabayAPI     string
+	PexelsKey      string
+	PixabayKey     string
 	Client         *http.Client
 	Remote         bool
 	Procedural     bool
@@ -93,12 +102,14 @@ type Resolver struct {
 func New(assetDir, manifestPath, cacheDir string) *Resolver {
 	r := &Resolver{
 		AssetDir: assetDir, Manifest: manifestPath, CacheDir: cacheDir,
-		API: defaultCommonsAPI, Client: &http.Client{Timeout: 25 * time.Second},
+		API: defaultCommonsAPI, PexelsAPI: defaultPexelsAPI, PixabayAPI: defaultPixabayAPI,
+		PexelsKey: strings.TrimSpace(os.Getenv("PEXELS_API_KEY")), PixabayKey: strings.TrimSpace(os.Getenv("PIXABAY_API_KEY")),
+		Client:     &http.Client{Timeout: 25 * time.Second},
 		Remote:     os.Getenv("CENARIUS_NO_REMOTE_ASSETS") != "1",
 		Procedural: true, AllowSelfBroll: true,
 		FFmpeg: "ffmpeg", MaxBytes: maxRemoteAssetBytes,
 		Validator:   FFValidator{FFprobe: "ffprobe", FFmpeg: "ffmpeg"},
-		MaxSearches: 8, MaxCandidates: 5,
+		MaxSearches: 18, MaxCandidates: 5,
 	}
 	r.cache = Cache{Dir: cacheDir, NegTTL: 24 * time.Hour}
 	return r
@@ -129,7 +140,7 @@ func (r *Resolver) init() {
 		r.MaxBytes = maxRemoteAssetBytes
 	}
 	if r.MaxSearches <= 0 {
-		r.MaxSearches = 8
+		r.MaxSearches = 18
 	}
 	if r.MaxCandidates <= 0 {
 		r.MaxCandidates = 5
@@ -139,6 +150,12 @@ func (r *Resolver) init() {
 	}
 	if r.API == "" {
 		r.API = defaultCommonsAPI
+	}
+	if r.PexelsAPI == "" {
+		r.PexelsAPI = defaultPexelsAPI
+	}
+	if r.PixabayAPI == "" {
+		r.PixabayAPI = defaultPixabayAPI
 	}
 }
 
@@ -156,9 +173,11 @@ func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Pla
 	out.VisualEvents = nil
 	var attributions []Asset
 	counts := map[string]int{}
+	used := map[string]bool{}
+	usedConcepts := map[string]int{}
 	for _, e := range p.VisualEvents {
 		started := time.Now()
-		ref, a, err := r.ResolveEvent(ctx, e)
+		ref, a, err := r.resolveEvent(ctx, e, used)
 		if err != nil {
 			logger.Warn("visual.asset.fallback", "event", e.ID, "concept", e.Concept, "fallback", "drop", "error", err)
 			counts["dropped"]++
@@ -166,6 +185,8 @@ func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Pla
 		}
 		e.Asset = ref
 		counts[ref.Source]++
+		markUsedRef(used, ref)
+		usedConcepts[normalize(e.Concept)]++
 		if a != nil {
 			a.EventID = e.ID
 			attributions = append(attributions, *a)
@@ -175,18 +196,18 @@ func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Pla
 	}
 	total := len(p.VisualEvents)
 	logger.Info("visual.asset.summary", "events", total, "local", counts[SourceLocal], "cache", counts[SourceCache],
-		"remote", counts[SourceCommons], "procedural", counts[SourceProcedure], "self_broll", counts[SourceSelfBroll], "dropped", counts["dropped"])
+		"pexels", counts[SourcePexels], "pixabay", counts[SourcePixabay], "commons", counts[SourceCommons],
+		"procedural", counts[SourceProcedure], "self_broll", counts[SourceSelfBroll], "dropped", counts["dropped"], "unique_concepts", len(usedConcepts))
 	if total > 0 && counts[SourceSelfBroll]*2 >= total && counts[SourceSelfBroll] > 0 {
 		logger.Warn("visual.asset.self_broll_majority", "self_broll", counts[SourceSelfBroll], "events", total,
-			"hint", "nenhum B-roll real foi encontrado: adicione assets locais em assets/manifest.json ou verifique a rede/Wikimedia Commons")
+			"hint", "nenhum B-roll real foi encontrado: adicione assets locais, configure PEXELS_API_KEY/PIXABAY_API_KEY ou verifique a rede/Wikimedia Commons")
 	}
 	return out, attributions
 }
 
 func (r *Resolver) kindsFor(e planner.VisualEvent) []string {
-	if e.Layout == planner.LayoutCard || e.Layout == planner.LayoutPIP || e.Type == planner.TypeCard {
-		return []string{"image", "video"}
-	}
+	// Prefer moving footage for every layout. Cards/PiP can still use video and
+	// fall back to images when that is the better/only semantic match.
 	return []string{"video", "image"}
 }
 
@@ -203,8 +224,16 @@ func eventQueries(e planner.VisualEvent) []string {
 	return qs
 }
 
-// ResolveEvent walks the priority chain for one event.
+// ResolveEvent walks the priority chain for one event. It intentionally does
+// not share a used-set so callers outside a render retain the v1.6 behaviour.
 func (r *Resolver) ResolveEvent(ctx context.Context, e planner.VisualEvent) (*planner.AssetRef, *Asset, error) {
+	return r.resolveEvent(ctx, e, nil)
+}
+
+// resolveEvent is the render-aware resolver. When used is non-nil, an asset
+// already selected earlier in the same plan is skipped and the next candidate
+// is tried. This prevents the visually cheap "same B-roll again" failure mode.
+func (r *Resolver) resolveEvent(ctx context.Context, e planner.VisualEvent, used map[string]bool) (*planner.AssetRef, *Asset, error) {
 	r.init()
 	logger := logx.From(ctx)
 	if err := r.cache.Ensure(); err != nil {
@@ -215,7 +244,7 @@ func (r *Resolver) ResolveEvent(ctx context.Context, e planner.VisualEvent) (*pl
 
 	// 1. local library
 	for _, q := range append(qs, e.Label) {
-		if a, ok := r.local(ctx, e.Concept, q); ok {
+		if a, ok := r.local(ctx, e.Concept, q, used); ok {
 			return r.done(ctx, e, a, "local")
 		}
 	}
@@ -223,41 +252,75 @@ func (r *Resolver) ResolveEvent(ctx context.Context, e planner.VisualEvent) (*pl
 	for _, kind := range kinds {
 		for _, q := range qs {
 			if a, ok := r.cache.Lookup(kind, q); ok {
-				logger.Info("visual.asset.cache_hit", "event", e.ID, "level", "query", "query", q, "kind", kind, "path", a.Path)
-				a.Origin = strings.TrimPrefix(a.Source, "cache:")
-				if a.Origin == SourceCache || a.Origin == "" {
-					a.Origin = SourceCommons
+				if assetUsed(used, a) {
+					logger.Info("visual.asset.duplicate_skip", "event", e.ID, "tier", "cache", "query", q, "path", a.Path)
+					continue
 				}
+				logger.Info("visual.asset.cache_hit", "event", e.ID, "level", "query", "query", q, "kind", kind, "path", a.Path)
+				origin := a.Origin
+				if origin == "" || origin == SourceCache {
+					origin = a.Source
+				}
+				if origin == "" || origin == SourceCache {
+					origin = SourceCommons
+				}
+				a.Origin = origin
 				a.Source = SourceCache
 				return r.done(ctx, e, a, "cache")
 			}
 		}
 	}
-	// 3+4. remote video, then remote image (image first for cards)
+	// 3..7. remote providers in editorial priority order:
+	// Pexels video -> Pixabay video -> Pexels image -> Pixabay image -> Commons.
 	var lastErr error
 	if r.Remote {
+		type tier struct{ provider, kind string }
+		tiers := []tier{}
+		if r.PexelsKey != "" {
+			tiers = append(tiers, tier{SourcePexels, "video"})
+		}
+		if r.PixabayKey != "" {
+			tiers = append(tiers, tier{SourcePixabay, "video"})
+		}
+		if r.PexelsKey != "" {
+			tiers = append(tiers, tier{SourcePexels, "image"})
+		}
+		if r.PixabayKey != "" {
+			tiers = append(tiers, tier{SourcePixabay, "image"})
+		}
+		tiers = append(tiers, tier{SourceCommons, "video"}, tier{SourceCommons, "image"})
 		searches := 0
-		for _, kind := range kinds {
-			for _, q := range qs {
+		for _, t := range tiers {
+			for qi, q := range qs {
+				// Three semantically distinct queries per provider tier are enough to
+				// explore alternatives while guaranteeing the lower-priority providers
+				// are still reached before the per-event request budget is exhausted.
+				if qi >= 3 {
+					break
+				}
 				if searches >= r.MaxSearches {
 					break
 				}
-				if r.cache.RecentMiss(kind, q) {
-					logger.Debug("visual.asset.query", "event", e.ID, "query", q, "kind", kind, "skip", "recent miss")
+				missKey := t.provider + ":" + t.kind
+				if r.cache.RecentMiss(missKey, q) {
+					logger.Debug("visual.asset.query", "event", e.ID, "provider", t.provider, "query", q, "kind", t.kind, "skip", "recent miss")
 					continue
 				}
 				searches++
-				logger.Info("visual.asset.query", "event", e.ID, "concept", e.Concept, "query", q, "kind", kind, "attempt", searches)
-				a, err := r.remote(ctx, e, q, kind)
+				logger.Info("visual.asset.query", "event", e.ID, "concept", e.Concept, "provider", t.provider, "query", q, "kind", t.kind, "attempt", searches)
+				a, err := r.remoteProvider(ctx, e, q, t.kind, t.provider, used)
 				if err == nil {
-					r.cache.Store(kind, q, a)
-					return r.done(ctx, e, a, "remote-"+kind)
+					r.cache.Store(t.kind, q, a)
+					return r.done(ctx, e, a, "remote-"+t.provider+"-"+t.kind)
 				}
 				lastErr = err
-				logger.Info("visual.asset.query_miss", "event", e.ID, "query", q, "kind", kind, "error", err)
+				logger.Info("visual.asset.query_miss", "event", e.ID, "provider", t.provider, "query", q, "kind", t.kind, "error", err)
 				if !isTransient(err) {
-					r.cache.MarkMiss(kind, q)
+					r.cache.MarkMiss(missKey, q)
 				}
+			}
+			if searches >= r.MaxSearches {
+				break
 			}
 		}
 	} else {
@@ -328,14 +391,27 @@ func toRef(a Asset) *planner.AssetRef {
 		URL: firstNonEmpty(a.SourceURL, a.URL), License: a.License, Author: a.Author, Duration: a.Duration}
 }
 
-func (r *Resolver) remote(ctx context.Context, e planner.VisualEvent, query, kind string) (Asset, error) {
+func (r *Resolver) remoteProvider(ctx context.Context, e planner.VisualEvent, query, kind, provider string, used map[string]bool) (Asset, error) {
 	logger := logx.From(ctx)
-	cands, err := r.searchCommons(ctx, query, kind, e.Layout)
+	var (
+		cands []Candidate
+		err   error
+	)
+	switch provider {
+	case SourcePexels:
+		cands, err = r.searchPexels(ctx, query, kind, e.Layout)
+	case SourcePixabay:
+		cands, err = r.searchPixabay(ctx, query, kind, e.Layout)
+	case SourceCommons:
+		cands, err = r.searchCommons(ctx, query, kind, e.Layout)
+	default:
+		return Asset{}, fmt.Errorf("provedor desconhecido: %s", provider)
+	}
 	if err != nil {
 		return Asset{}, transientErr{err}
 	}
 	if len(cands) == 0 {
-		return Asset{}, fmt.Errorf("nenhum candidato %s para %q", kind, query)
+		return Asset{}, fmt.Errorf("%s: nenhum candidato %s para %q", provider, kind, query)
 	}
 	tried := 0
 	for _, c := range cands {
@@ -347,26 +423,88 @@ func (r *Resolver) remote(ctx context.Context, e planner.VisualEvent, query, kin
 			if i >= 5 {
 				break
 			}
-			path, m, err := r.download(ctx, u, kind)
-			if err != nil {
-				logger.Info("visual.asset.invalid", "event", e.ID, "title", c.Title, "url", u, "error", err)
+			if used != nil && used["url:"+u] {
+				logger.Info("visual.asset.duplicate_skip", "event", e.ID, "provider", provider, "title", c.Title, "url", u)
 				continue
 			}
-			logger.Info("visual.asset.valid", "event", e.ID, "title", c.Title, "path", path, "width", m.Width, "height", m.Height, "duration_s", m.Duration)
-			attribution := strings.Join(nonEmpty(c.Author, c.License, c.Credit, "via Wikimedia Commons"), " · ")
-			return Asset{Keyword: e.Concept, Query: query, Path: path, Source: SourceCommons, MediaType: kind, URL: u,
-				SourceURL: c.Page, License: c.License, Author: c.Author, Attribution: attribution,
-				Duration: m.Duration, Width: m.Width, Height: m.Height}, nil
+			path, m, err := r.download(ctx, provider, u, kind)
+			if err != nil {
+				logger.Info("visual.asset.invalid", "event", e.ID, "provider", provider, "title", c.Title, "url", u, "error", err)
+				continue
+			}
+			a := Asset{Keyword: e.Concept, Query: query, Path: path, Source: provider, MediaType: kind, URL: u,
+				SourceURL: c.Page, License: c.License, Author: c.Author,
+				Attribution: strings.Join(nonEmpty(c.Author, c.License, c.Credit, "via "+providerLabel(provider)), " · "),
+				Duration:    m.Duration, Width: m.Width, Height: m.Height}
+			if assetUsed(used, a) {
+				logger.Info("visual.asset.duplicate_skip", "event", e.ID, "provider", provider, "title", c.Title, "path", path)
+				continue
+			}
+			logger.Info("visual.asset.valid", "event", e.ID, "provider", provider, "title", c.Title, "path", path, "width", m.Width, "height", m.Height, "duration_s", m.Duration)
+			return a, nil
 		}
 	}
-	return Asset{}, fmt.Errorf("nenhum %s válido entre %d candidatos para %q", kind, tried, query)
+	return Asset{}, fmt.Errorf("%s: nenhum %s válido entre %d candidatos para %q", provider, kind, tried, query)
+}
+
+func providerLabel(source string) string {
+	switch source {
+	case SourcePexels:
+		return "Pexels"
+	case SourcePixabay:
+		return "Pixabay"
+	default:
+		return "Wikimedia Commons"
+	}
+}
+
+func assetUsed(used map[string]bool, a Asset) bool {
+	if used == nil {
+		return false
+	}
+	for _, k := range assetKeys(a.Path, a.URL, a.SourceURL) {
+		if used[k] {
+			return true
+		}
+	}
+	return false
+}
+
+func markUsedRef(used map[string]bool, ref *planner.AssetRef) {
+	if used == nil || ref == nil || ref.Source == SourceSelfBroll || ref.Source == SourceProcedure {
+		return
+	}
+	for _, k := range assetKeys(ref.Path, ref.URL) {
+		used[k] = true
+	}
+}
+
+func assetKeys(values ...string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		prefix := "url:"
+		if strings.HasPrefix(v, "/") || strings.HasPrefix(v, ".") {
+			prefix = "path:"
+		}
+		k := prefix + v
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 type transientErr struct{ error }
 
 func isTransient(err error) bool { _, ok := err.(transientErr); return ok }
 
-func (r *Resolver) local(ctx context.Context, concept, query string) (Asset, bool) {
+func (r *Resolver) local(ctx context.Context, concept, query string, used map[string]bool) (Asset, bool) {
 	b, err := os.ReadFile(r.Manifest)
 	if err != nil {
 		return Asset{}, false
@@ -408,8 +546,13 @@ func (r *Resolver) local(ctx context.Context, concept, query string) (Asset, boo
 		if license == "" {
 			license = "local (fornecido pelo usuário)"
 		}
-		return Asset{Keyword: concept, Query: query, Path: p, Source: SourceLocal, MediaType: kind, SourceURL: x.SourceURL,
-			License: license, Author: x.Author, Duration: md.Duration, Width: md.Width, Height: md.Height}, true
+		a := Asset{Keyword: concept, Query: query, Path: p, Source: SourceLocal, MediaType: kind, SourceURL: x.SourceURL,
+			License: license, Author: x.Author, Duration: md.Duration, Width: md.Width, Height: md.Height}
+		if assetUsed(used, a) {
+			logx.From(ctx).Info("visual.asset.duplicate_skip", "tier", "local", "query", query, "path", p)
+			continue
+		}
+		return a, true
 	}
 	return Asset{}, false
 }

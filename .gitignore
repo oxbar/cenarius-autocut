@@ -3,3 +3,5 @@
 /models/*.bin
 /.smoke/
 .DS_Store
+
+.env

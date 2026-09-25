@@ -114,7 +114,7 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	logger.Info("stage.timing", "stage", "plan", "duration_ms", time.Since(stageStart).Milliseconds())
 	logger.Info("edit.plan.pre_assets", "visual_events", len(plan.VisualEvents), "zooms", len(plan.Zooms), "sfx", len(plan.SFX), "emphasis", len(plan.Emphasis), "json", planner.DebugJSON(plan))
 
-	p("assets", 68, "resolvendo B-roll real (local, cache, Wikimedia Commons, procedural)")
+	p("assets", 68, "resolvendo B-roll real (local, cache, Pexels, Pixabay, Wikimedia, procedural)")
 	stageStart = time.Now()
 	resolver := assets.NewFromConfig(cfg)
 	plan, resolvedAssets := resolver.ResolvePlan(ctx, plan)

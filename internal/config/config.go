@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Config struct {
@@ -52,21 +53,24 @@ type CutConfig struct {
 }
 
 type CaptionConfig struct {
-	Enabled         bool   `json:"enabled"`
-	FontName        string `json:"font_name"`
-	FontSize        int    `json:"font_size"`
-	PrimaryColor    string `json:"primary_color"`
-	HighlightColor  string `json:"highlight_color"`
-	OutlineColor    string `json:"outline_color"`
-	Outline         int    `json:"outline"`
-	Shadow          int    `json:"shadow"`
-	MarginV         int    `json:"margin_v"`
-	SafeMargin      int    `json:"safe_margin"`
-	MaxWords        int    `json:"max_words"`
-	MaxCharsPerLine int    `json:"max_chars_per_line"`
-	MaxLines        int    `json:"max_lines"`
-	Uppercase       bool   `json:"uppercase"`
-	ActiveWord      bool   `json:"active_word"`
+	Enabled         bool    `json:"enabled"`
+	FontName        string  `json:"font_name"`
+	FontSize        int     `json:"font_size"`
+	PrimaryColor    string  `json:"primary_color"`
+	HighlightColor  string  `json:"highlight_color"`
+	OutlineColor    string  `json:"outline_color"`
+	Outline         int     `json:"outline"`
+	Shadow          int     `json:"shadow"`
+	MarginV         int     `json:"margin_v"`
+	SafeMargin      int     `json:"safe_margin"`
+	MaxWords        int     `json:"max_words"`
+	MaxCharsPerLine int     `json:"max_chars_per_line"`
+	MaxLines        int     `json:"max_lines"`
+	Uppercase       bool    `json:"uppercase"`
+	ActiveWord      bool    `json:"active_word"`
+	TimingOffset    float64 `json:"timing_offset"`   // seconds; positive delays captions slightly behind ASR timestamps
+	ActiveScale     float64 `json:"active_scale"`    // active-word scale, e.g. 1.05
+	MaxWidthRatio   float64 `json:"max_width_ratio"` // usable caption width as ratio of PlayResX
 }
 
 type ZoomConfig struct {
@@ -103,9 +107,9 @@ func Default() Config {
 		Ollama:   OllamaConfig{Enabled: true, URL: "http://127.0.0.1:11434", Model: "qwen3:8b"},
 		Output:   OutputConfig{Width: 1080, Height: 1920, FPS: 30, CRF: 18, Preset: "medium", AudioBitrate: "192k"},
 		Cuts:     CutConfig{Enabled: true, NoiseDB: -42, MinSilence: 1.10, KeepSilence: 0.25, MinKeepSegment: 0.20},
-		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 82, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 6, Shadow: 0, MarginV: 560, SafeMargin: 96, MaxWords: 6, MaxCharsPerLine: 24, MaxLines: 2, Uppercase: true, ActiveWord: true},
+		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 74, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 5, Shadow: 0, MarginV: 560, SafeMargin: 112, MaxWords: 6, MaxCharsPerLine: 22, MaxLines: 2, Uppercase: true, ActiveWord: true, TimingOffset: 0.06, ActiveScale: 1.05, MaxWidthRatio: 0.80},
 		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Emphasis: 1.085, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
-		Broll: BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 5,
+		Broll: BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 12,
 			MinVisualGap: 0.35, Remote: true, Procedural: true, AllowSelfBroll: true, MaxRemoteMB: 60,
 			ReactionSplit: 0.5, ReactionFocusY: 0.40, SeamCaptions: true},
 	}
@@ -143,7 +147,16 @@ func (c *Config) Normalize(base string) error {
 		c.Captions.MaxLines = 2
 	}
 	if c.Captions.SafeMargin <= 0 {
-		c.Captions.SafeMargin = 96
+		c.Captions.SafeMargin = 112
+	}
+	if c.Captions.ActiveScale <= 1 || c.Captions.ActiveScale > 1.15 {
+		c.Captions.ActiveScale = 1.05
+	}
+	if c.Captions.MaxWidthRatio <= 0 || c.Captions.MaxWidthRatio > 0.92 {
+		c.Captions.MaxWidthRatio = 0.80
+	}
+	if c.Captions.TimingOffset < -0.20 || c.Captions.TimingOffset > 0.35 {
+		c.Captions.TimingOffset = 0.06
 	}
 	if c.Broll.MinVisualGap <= 0 {
 		c.Broll.MinVisualGap = 0.35
@@ -165,5 +178,42 @@ func (c *Config) Normalize(base string) error {
 	}
 	// Keep relative paths relative to the process cwd by default; this makes CLI behavior predictable.
 	_ = base
+	return nil
+}
+
+// LoadEnvFile loads simple KEY=VALUE pairs without overwriting variables that
+// are already present in the process environment. It intentionally ignores
+// malformed lines and never returns/prints secret values.
+func LoadEnvFile(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = value[1 : len(value)-1]
+		}
+		_ = os.Setenv(key, value)
+	}
 	return nil
 }

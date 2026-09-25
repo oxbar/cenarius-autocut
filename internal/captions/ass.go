@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"cenarius-autocut/internal/config"
 	"cenarius-autocut/internal/planner"
@@ -42,7 +41,7 @@ func posTag(t float64, ws []Window) string {
 // GenerateASSWithLayout is GenerateASS plus optional per-layout positioning.
 // Style, highlight, outline, line limits and word sync are unchanged.
 func GenerateASSWithLayout(path string, tokens []transcribe.Token, cfg config.CaptionConfig, emphasis []string, windows []Window) error {
-	cues := GroupSmart(tokens, cfg.MaxWords, cfg.MaxCharsPerLine, cfg.MaxLines)
+	cues := groupSmartConfigured(tokens, cfg)
 	em := map[string]bool{}
 	for _, x := range emphasis {
 		em[strings.ToLower(cleanWord(x))] = true
@@ -64,9 +63,10 @@ func GenerateASSWithLayout(path string, tokens []transcribe.Token, cfg config.Ca
 			continue
 		}
 		if !cfg.ActiveWord {
+			start, end := shifted(c.Start, cfg.TimingOffset), shifted(c.End, cfg.TimingOffset)
 			text := renderCue(c.Words, -1, cfg, em)
-			text = posTag(c.Start, windows) + "{\\fad(45,65)\\blur0.35}" + text
-			b.WriteString(fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", assTime(c.Start), assTime(c.End), text))
+			text = posTag(start, windows) + "{\\fad(45,65)\\blur0.35}" + text
+			b.WriteString(fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", assTime(start), assTime(end), text))
 			continue
 		}
 
@@ -88,6 +88,7 @@ func GenerateASSWithLayout(path string, tokens []transcribe.Token, cfg config.Ca
 			if end <= start {
 				continue
 			}
+			start, end = shifted(start, cfg.TimingOffset), shifted(end, cfg.TimingOffset)
 			prefix := "{\\blur0.35}"
 			if i == 0 {
 				prefix = "{\\fad(35,0)\\blur0.35\\fscx103\\fscy103\\t(0,100,\\fscx100\\fscy100)}"
@@ -105,11 +106,19 @@ func Group(tokens []transcribe.Token, maxWords int) []Cue {
 }
 
 func GroupSmart(tokens []transcribe.Token, maxWords, maxCharsPerLine, maxLines int) []Cue {
+	return groupSmart(tokens, maxWords, float64(maxCharsPerLine), maxLines)
+}
+
+func groupSmartConfigured(tokens []transcribe.Token, cfg config.CaptionConfig) []Cue {
+	return groupSmart(tokens, cfg.MaxWords, maxLineUnits(cfg), cfg.MaxLines)
+}
+
+func groupSmart(tokens []transcribe.Token, maxWords int, maxLineUnits float64, maxLines int) []Cue {
 	if maxWords < 1 {
 		maxWords = 6
 	}
-	if maxCharsPerLine < 8 {
-		maxCharsPerLine = 24
+	if maxLineUnits < 8 {
+		maxLineUnits = 24
 	}
 	if maxLines < 1 {
 		maxLines = 2
@@ -146,7 +155,7 @@ func GroupSmart(tokens []transcribe.Token, maxWords, maxCharsPerLine, maxLines i
 
 		if len(cur.Words) > 0 {
 			candidate := append(append([]transcribe.Token(nil), cur.Words...), t)
-			if len(candidate) > maxWords || !fitsLines(candidate, maxCharsPerLine, maxLines) {
+			if len(candidate) > maxWords || !fitsLinesUnits(candidate, maxLineUnits, maxLines) {
 				flush()
 			}
 		}
@@ -160,7 +169,7 @@ func GroupSmart(tokens []transcribe.Token, maxWords, maxCharsPerLine, maxLines i
 }
 
 func renderCue(words []transcribe.Token, active int, cfg config.CaptionConfig, emphasis map[string]bool) string {
-	lines := layoutLines(words, cfg.MaxCharsPerLine, cfg.MaxLines)
+	lines := layoutLinesUnits(words, maxLineUnits(cfg), cfg.MaxLines)
 	rendered := make([]string, 0, len(lines))
 	for _, line := range lines {
 		parts := make([]string, 0, len(line))
@@ -172,7 +181,8 @@ func renderCue(words []transcribe.Token, active int, cfg config.CaptionConfig, e
 			raw = escapeASS(raw)
 			isEm := emphasis[strings.ToLower(cleanWord(words[idx].Text))]
 			if idx == active {
-				raw = "{\\c" + cfg.HighlightColor + "\\fscx108\\fscy108}" + raw + "{\\c" + cfg.PrimaryColor + "\\fscx100\\fscy100}"
+				scale := activeScalePercent(cfg)
+				raw = fmt.Sprintf("{\\c%s\\fscx%d\\fscy%d}%s{\\c%s\\fscx100\\fscy100}", cfg.HighlightColor, scale, scale, raw, cfg.PrimaryColor)
 			} else if isEm {
 				raw = "{\\c" + cfg.HighlightColor + "}" + raw + "{\\c" + cfg.PrimaryColor + "}"
 			}
@@ -184,45 +194,123 @@ func renderCue(words []transcribe.Token, active int, cfg config.CaptionConfig, e
 }
 
 func fitsLines(words []transcribe.Token, maxChars, maxLines int) bool {
-	return len(layoutLines(words, maxChars, maxLines+1)) <= maxLines
+	return fitsLinesUnits(words, float64(maxChars), maxLines)
+}
+
+func fitsLinesUnits(words []transcribe.Token, maxUnits float64, maxLines int) bool {
+	return len(layoutLinesUnits(words, maxUnits, maxLines+1)) <= maxLines
 }
 
 func layoutLines(words []transcribe.Token, maxChars, maxLines int) [][]int {
-	if maxChars <= 0 {
-		maxChars = 24
+	return layoutLinesUnits(words, float64(maxChars), maxLines)
+}
+
+// layoutLinesUnits estimates glyph width rather than treating every rune as
+// equally wide. This is deliberately conservative because active-word scaling
+// must still remain inside the horizontal safe area.
+func layoutLinesUnits(words []transcribe.Token, maxUnits float64, maxLines int) [][]int {
+	if maxUnits <= 0 {
+		maxUnits = 24
 	}
 	var lines [][]int
 	var cur []int
-	curLen := 0
+	curWidth := 0.0
 	for i, w := range words {
-		n := utf8.RuneCountInString(cleanWord(w.Text))
-		if n == 0 {
-			n = utf8.RuneCountInString(w.Text)
+		width := wordUnits(cleanWord(w.Text))
+		if width == 0 {
+			width = wordUnits(w.Text)
 		}
-		extra := n
+		extra := width
 		if len(cur) > 0 {
-			extra++
+			extra += 0.55 // inter-word space
 		}
-		if len(cur) > 0 && curLen+extra > maxChars {
+		if len(cur) > 0 && curWidth+extra > maxUnits {
 			lines = append(lines, cur)
 			cur = nil
-			curLen = 0
+			curWidth = 0
+			extra = width
 		}
 		cur = append(cur, i)
-		if curLen > 0 {
-			curLen++
-		}
-		curLen += n
+		curWidth += extra
 	}
 	if len(cur) > 0 {
 		lines = append(lines, cur)
 	}
-	// GroupSmart normally guarantees maxLines. For a single pathological word,
-	// prefer showing it rather than clipping or dropping it.
+	// groupSmart normally guarantees maxLines. A single pathological word is
+	// still shown rather than silently discarded.
 	if maxLines > 0 && len(lines) > maxLines {
 		return lines
 	}
 	return lines
+}
+
+func wordUnits(s string) float64 {
+	var n float64
+	for _, r := range s {
+		switch {
+		case unicode.IsSpace(r):
+			n += 0.55
+		case strings.ContainsRune("MW@#%&QGO0", unicode.ToUpper(r)):
+			n += 1.25
+		case strings.ContainsRune("Iil1|!.,:'`", r):
+			n += 0.55
+		case unicode.IsUpper(r):
+			n += 1.05
+		default:
+			n += 1.0
+		}
+	}
+	return n
+}
+
+// maxLineUnits turns the actual 1080px safe width into conservative glyph
+// units. MaxCharsPerLine remains a hard editorial cap.
+func maxLineUnits(cfg config.CaptionConfig) float64 {
+	margin := cfg.SafeMargin
+	if margin <= 0 {
+		margin = 112
+	}
+	ratio := cfg.MaxWidthRatio
+	if ratio <= 0 || ratio > 0.92 {
+		ratio = 0.80
+	}
+	usable := float64(1080 - 2*margin)
+	if byRatio := 1080.0 * ratio; byRatio < usable {
+		usable = byRatio
+	}
+	fontSize := cfg.FontSize
+	if fontSize <= 0 {
+		fontSize = 74
+	}
+	scale := cfg.ActiveScale
+	if scale <= 1 || scale > 1.15 {
+		scale = 1.05
+	}
+	// Average uppercase Latin glyph is roughly 0.58em in common sans fonts.
+	units := usable / (float64(fontSize) * 0.58 * scale)
+	if cap := cfg.MaxCharsPerLine; cap > 0 && units > float64(cap) {
+		units = float64(cap)
+	}
+	if units < 8 {
+		units = 8
+	}
+	return units
+}
+
+func activeScalePercent(cfg config.CaptionConfig) int {
+	s := cfg.ActiveScale
+	if s <= 1 || s > 1.15 {
+		s = 1.05
+	}
+	return int(s*100 + 0.5)
+}
+
+func shifted(t, offset float64) float64 {
+	t += offset
+	if t < 0 {
+		return 0
+	}
+	return t
 }
 
 func assTime(v float64) string {

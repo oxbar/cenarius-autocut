@@ -54,7 +54,7 @@ Responda SOMENTE com JSON válido, sem markdown, sem texto extra, exatamente nes
 
 REGRAS:
 - Analise cada unidade com a anterior e a seguinte: gancho, explicação, exemplo, punchline, mudança de ideia, CTA, emoção.
-- Vídeo de 20-30s: 3 a 5 visual_events no total. Nunca mais de 6. Não deixe mais de ~7s sem mudança visual se houver ideia visualizável.
+- Vídeo de 20-30s: 3 a 5 visual_events no total. Para >30s, escale gradualmente (~1 insert a cada 7-10s), no máximo 12. Não deixe longos trechos estáticos quando houver ideia visualizável.
 - visual_events NÃO podem se sobrepor. Deixe pelo menos 0.4s de A-roll entre eles.
 - O primeiro segundo é do creator (sem B-roll antes de 1.2s); use punch_zoom 1.07-1.10 no gancho.
 - type: "broll" (vídeo/foto contextual), "card" (logo, print, interface, entidade), "pip" (imagem pequena).

@@ -60,6 +60,8 @@ const (
 const (
 	SourceLocal     = "local"
 	SourceCache     = "cache"
+	SourcePexels    = "pexels"
+	SourcePixabay   = "pixabay"
 	SourceCommons   = "wikimedia-commons"
 	SourceProcedure = "procedural"
 	SourceSelfBroll = "self-broll"
@@ -122,7 +124,7 @@ type Plan struct {
 	Emphasis []string       `json:"emphasis"`
 }
 
-const PlanVersion = "1.6"
+const PlanVersion = "1.7"
 
 // MigrateLegacy converts legacy overlays into visual events so old plans and
 // old-style Ollama answers keep working.
