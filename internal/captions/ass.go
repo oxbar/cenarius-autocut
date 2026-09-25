@@ -18,7 +18,30 @@ type Cue struct {
 	Words      []transcribe.Token
 }
 
+// Window moves captions to a different anchor while a layout is on screen
+// (e.g. the seam of a reaction split), like professional Shorts do.
+type Window struct {
+	Start, End float64
+	Y          int // vertical centre in the 1080x1920 PlayRes
+}
+
 func GenerateASS(path string, tokens []transcribe.Token, cfg config.CaptionConfig, emphasis []string) error {
+	return GenerateASSWithLayout(path, tokens, cfg, emphasis, nil)
+}
+
+// posTag returns the override that anchors a line starting at t, or "".
+func posTag(t float64, ws []Window) string {
+	for _, w := range ws {
+		if t >= w.Start-0.04 && t < w.End {
+			return fmt.Sprintf("{\\an5\\pos(540,%d)}", w.Y)
+		}
+	}
+	return ""
+}
+
+// GenerateASSWithLayout is GenerateASS plus optional per-layout positioning.
+// Style, highlight, outline, line limits and word sync are unchanged.
+func GenerateASSWithLayout(path string, tokens []transcribe.Token, cfg config.CaptionConfig, emphasis []string, windows []Window) error {
 	cues := GroupSmart(tokens, cfg.MaxWords, cfg.MaxCharsPerLine, cfg.MaxLines)
 	em := map[string]bool{}
 	for _, x := range emphasis {
@@ -42,7 +65,7 @@ func GenerateASS(path string, tokens []transcribe.Token, cfg config.CaptionConfi
 		}
 		if !cfg.ActiveWord {
 			text := renderCue(c.Words, -1, cfg, em)
-			text = "{\\fad(45,65)\\blur0.35}" + text
+			text = posTag(c.Start, windows) + "{\\fad(45,65)\\blur0.35}" + text
 			b.WriteString(fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", assTime(c.Start), assTime(c.End), text))
 			continue
 		}
@@ -69,7 +92,7 @@ func GenerateASS(path string, tokens []transcribe.Token, cfg config.CaptionConfi
 			if i == 0 {
 				prefix = "{\\fad(35,0)\\blur0.35\\fscx103\\fscy103\\t(0,100,\\fscx100\\fscy100)}"
 			}
-			text := prefix + renderCue(c.Words, i, cfg, em)
+			text := posTag(start, windows) + prefix + renderCue(c.Words, i, cfg, em)
 			b.WriteString(fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", assTime(start), assTime(end), text))
 		}
 	}

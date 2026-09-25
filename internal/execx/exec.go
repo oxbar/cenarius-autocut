@@ -63,11 +63,19 @@ func tail(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-var sensitiveMetadataRE = regexp.MustCompile(`(?m)^.*com\.apple\.quicktime\.location(?:\.ISO6709|\.accuracy\.horizontal)?[^\n]*\n?`)
+var sensitiveMetadataRE = regexp.MustCompile(`(?mi)^.*(?:com\.apple\.quicktime\.location|\blocation(?:-eng)?\s*[:=]|\bgps[\w.-]*|\blatitude\b|\blongitude\b|ISO6709)[^\n]*\n?`)
+
+// iso6709RE catches bare coordinate strings such as "+23.5505-046.6333+760.000/".
+var iso6709RE = regexp.MustCompile(`[+-]\d{1,2}\.\d{3,}[+-]\d{1,3}\.\d{3,}(?:[+-]\d+(?:\.\d+)?)?/?`)
 
 // sanitizeLog keeps diagnostics useful without persisting precise location
-// metadata embedded by iPhone MOV files. The raw subprocess result returned to
-// the caller is unchanged; only debug.log is redacted.
+// metadata embedded by iPhone MOV files (QuickTime location, GPS, latitude,
+// longitude, ISO 6709 coordinates). The raw subprocess result returned to the
+// caller is unchanged; only debug.log is redacted.
 func sanitizeLog(s string) string {
-	return sensitiveMetadataRE.ReplaceAllString(s, "[redacted iPhone location metadata]\n")
+	s = sensitiveMetadataRE.ReplaceAllString(s, "[redacted location metadata]\n")
+	return iso6709RE.ReplaceAllString(s, "[redacted coordinates]")
 }
+
+// SanitizeLog exposes the redaction for other log writers and tests.
+func SanitizeLog(s string) string { return sanitizeLog(s) }

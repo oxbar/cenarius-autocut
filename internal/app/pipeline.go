@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"cenarius-autocut/internal/assets"
 	"cenarius-autocut/internal/captions"
@@ -106,14 +107,20 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	}
 	logger.Info("media.cut", "duration_s", cutInfo.Duration, "fps", cutInfo.FPS, "width", cutInfo.Width, "height", cutInfo.Height)
 
-	p("plan", 62, "planejando ritmo, zooms, imagens e efeitos")
-	plan := planner.Heuristic(mapped, cfg)
+	p("plan", 62, "planejando unidades semânticas, B-roll, zooms e efeitos")
+	stageStart := time.Now()
+	plan := planner.HeuristicCtx(ctx, mapped, cfg)
 	plan = planner.WithOllama(ctx, plan, mapped, cfg)
-	logger.Info("edit.plan.pre_assets", "zooms", len(plan.Zooms), "overlays", len(plan.Overlays), "sfx", len(plan.SFX), "emphasis", len(plan.Emphasis), "json", planner.DebugJSON(plan))
+	logger.Info("stage.timing", "stage", "plan", "duration_ms", time.Since(stageStart).Milliseconds())
+	logger.Info("edit.plan.pre_assets", "visual_events", len(plan.VisualEvents), "zooms", len(plan.Zooms), "sfx", len(plan.SFX), "emphasis", len(plan.Emphasis), "json", planner.DebugJSON(plan))
 
-	p("assets", 68, "resolvendo imagens e B-roll gratuitos")
-	resolver := assets.New(cfg.Broll.AssetDir, cfg.Broll.Manifest, filepath.Join(cfg.WorkDir, "asset-cache"))
+	p("assets", 68, "resolvendo B-roll real (local, cache, Wikimedia Commons, procedural)")
+	stageStart = time.Now()
+	resolver := assets.NewFromConfig(cfg)
 	plan, resolvedAssets := resolver.ResolvePlan(ctx, plan)
+	// Events dropped by the resolver must not leave orphan sound effects.
+	plan.SFX = planner.PlanSFX(plan.VisualEvents)
+	logger.Info("stage.timing", "stage", "assets", "duration_ms", time.Since(stageStart).Milliseconds())
 	attributionPath := filepath.Join(outDir, "assets-attribution.json")
 	if err := assets.WriteAttributions(attributionPath, resolvedAssets); err != nil {
 		return Result{}, fmt.Errorf("salvar atribuições de assets: %w", err)
@@ -124,19 +131,21 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	if err := os.WriteFile(planPath, pb, 0644); err != nil {
 		return Result{}, err
 	}
-	logger.Info("edit.plan", "zooms", len(plan.Zooms), "overlays", len(plan.Overlays), "sfx", len(plan.SFX), "emphasis", len(plan.Emphasis), "json", string(pb))
+	logger.Info("edit.plan", "visual_events", len(plan.VisualEvents), "zooms", len(plan.Zooms), "sfx", len(plan.SFX), "emphasis", len(plan.Emphasis), "json", string(pb))
 
 	ass := filepath.Join(outDir, "captions.ass")
 	p("captions", 72, "gerando legendas ASS dinâmicas")
-	if err := captions.GenerateASS(ass, mapped.Tokens, cfg.Captions, captions.EmphasisFromPlan(plan)); err != nil {
+	if err := captions.GenerateASSWithLayout(ass, mapped.Tokens, cfg.Captions, captions.EmphasisFromPlan(plan), captionWindows(cfg, plan)); err != nil {
 		return Result{}, err
 	}
 
 	final := filepath.Join(outDir, "final.mp4")
 	p("render", 78, "renderizando vídeo final")
+	stageStart = time.Now()
 	if err := render.Final(ctx, cfg, cutPath, ass, final, plan, cutInfo.HasAudio); err != nil {
 		return Result{}, err
 	}
+	logger.Info("stage.timing", "stage", "render", "duration_ms", time.Since(stageStart).Milliseconds())
 
 	finalInfo, err := media.Probe(ctx, cfg.FFprobe, final)
 	if err != nil {
@@ -153,6 +162,14 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	if durationDiff > tolerance {
 		return Result{}, fmt.Errorf("render alterou a duração: intermediário %.3fs, final %.3fs (diferença %.3fs). Veja %s", cutInfo.Duration, finalInfo.Duration, durationDiff, debugLog)
 	}
+	// Without intentional cuts the final must match the original clock.
+	if removed := info.Duration - expectedCutDuration; removed < 0.05 {
+		origDiff := math.Abs(finalInfo.Duration - info.Duration)
+		logger.Info("duration.check", "original_s", info.Duration, "final_s", finalInfo.Duration, "difference_s", origDiff, "tolerance_s", tolerance, "cuts", "none")
+		if origDiff > tolerance {
+			return Result{}, fmt.Errorf("duração mudou sem cortes: original %.3fs, final %.3fs (diferença %.3fs). Veja %s", info.Duration, finalInfo.Duration, origDiff, debugLog)
+		}
+	}
 
 	p("done", 100, "concluído")
 	return Result{
@@ -165,6 +182,25 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 		OriginalDuration: info.Duration,
 		FinalDuration:    finalInfo.Duration,
 	}, nil
+}
+
+// captionWindows moves captions to the split seam while a reaction/card
+// layout is on screen (reference Shorts style).
+func captionWindows(cfg config.Config, plan planner.Plan) []captions.Window {
+	if !cfg.Broll.SeamCaptions {
+		return nil
+	}
+	g := render.ComputeGeometry(cfg)
+	var ws []captions.Window
+	for _, e := range plan.VisualEvents {
+		if e.Asset == nil {
+			continue
+		}
+		if e.Layout == planner.LayoutReaction || e.Layout == planner.LayoutCard || e.Asset.Source == planner.SourceSelfBroll {
+			ws = append(ws, captions.Window{Start: e.Start, End: e.End, Y: g.SeamCaptionY})
+		}
+	}
+	return ws
 }
 
 func intervalsDuration(xs []silence.Interval) float64 {

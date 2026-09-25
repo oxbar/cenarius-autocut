@@ -51,12 +51,21 @@
     "mild": 1.06,
     "punch": 1.1,
     "min_gap": 4.0,
-    "duration": 1.0
+    "duration": 1.0,
+    "emphasis": 1.085
   },
   "broll": {
     "enabled": true,
     "asset_dir": "./assets/broll",
     "manifest": "./assets/manifest.json",
-    "max_events": 4
+    "max_events": 5,
+    "min_visual_gap": 0.35,
+    "remote": true,
+    "procedural": true,
+    "allow_self_broll": true,
+    "max_remote_mb": 60,
+    "reaction_split": 0.5,
+    "reaction_focus_y": 0.4,
+    "seam_captions": true
   }
 }

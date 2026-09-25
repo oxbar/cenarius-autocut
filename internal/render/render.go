@@ -3,11 +3,15 @@ package render
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"cenarius-autocut/internal/assets"
 	"cenarius-autocut/internal/config"
 	"cenarius-autocut/internal/execx"
 	"cenarius-autocut/internal/logx"
@@ -37,166 +41,199 @@ func Cut(ctx context.Context, cfg config.Config, input, output string, keep []si
 	return err
 }
 
-// Final renders a deterministic vertical timeline. Visual assets have already
-// been resolved by the pipeline. If an asset could not be resolved, a branded
-// context card is rendered instead of silently dropping the visual event.
+// Final renders the vertical timeline: A-roll (with intent-driven zooms), real
+// B-roll in reaction / fullscreen / card / PiP layouts, dynamic captions on top
+// of everything (B-roll never covers captions) and discrete SFX. Every B-roll
+// asset is first normalised by PrepareClip into a finite, silent clip, so the
+// final graph never has infinite inputs and cannot change the video duration.
 func Final(ctx context.Context, cfg config.Config, input, assPath, output string, plan planner.Plan, hasAudio bool) error {
 	logger := logx.From(ctx)
-	args := []string{"-y", "-i", input}
-	type ov struct {
-		event   planner.OverlayEvent
-		idx     int
-		isVideo bool
+	started := time.Now()
+	planner.MigrateLegacy(&plan)
+	g := ComputeGeometry(cfg)
+	W, H, fps := cfg.Output.Width, cfg.Output.Height, cfg.Output.FPS
+	parts := filepath.Join(filepath.Dir(output), "render-parts")
+	if err := os.MkdirAll(parts, 0755); err != nil {
+		return err
 	}
-	ovs := []ov{}
-	for _, e := range plan.Overlays {
-		if strings.TrimSpace(e.Asset) == "" {
-			continue
-		}
-		if _, err := os.Stat(e.Asset); err != nil {
-			logger.Warn("visual.effect.asset_missing", "asset", e.Asset, "keyword", e.Keyword, "error", err)
-			continue
-		}
+	events := append([]planner.VisualEvent(nil), plan.VisualEvents...)
+	sort.Slice(events, func(i, j int) bool { return events[i].Start < events[j].Start })
+	logger.Info("visual.render.start", "events", len(events), "zooms", len(plan.Zooms), "sfx", len(plan.SFX), "width", W, "height", H, "fps", fps)
+
+	args := []string{"-y", "-i", input}
+	next := 1
+	type item struct {
+		e                  planner.VisualEvent
+		clip, mask, shadow int
+		self               bool
+		labelFile          string
+	}
+	var items []item
+	for _, e := range events {
 		dur := e.End - e.Start
-		if dur < 0.5 {
-			dur = 0.5
+		if e.Asset == nil || dur < 0.3 {
+			logger.Warn("visual.render.event", "event", e.ID, "skipped", true, "reason", "sem asset ou duração curta")
+			continue
 		}
-		isVideo := e.AssetType == "video" || isVideoPath(e.Asset)
-		idx := 1 + len(ovs)
-		if isVideo {
-			// Loop the clip so a short source can still cover the planned interval.
-			// We discard B-roll audio and keep the presenter's original voice.
-			args = append(args, "-stream_loop", "-1", "-ss", "0.50", "-i", e.Asset)
+		it := item{e: e, mask: -1, shadow: -1}
+		if e.Asset.Source == planner.SourceSelfBroll || e.Asset.Path == "" {
+			it.self = true
 		} else {
-			args = append(args, "-loop", "1", "-framerate", strconv.Itoa(cfg.Output.FPS), "-t", fmt.Sprintf("%.3f", dur), "-i", e.Asset)
+			spec := ClipSpec{Width: W, Height: H - g.Split, Duration: dur, Motion: len(items)}
+			switch e.Layout {
+			case planner.LayoutFullscreen:
+				spec.Width, spec.Height = W, H
+			case planner.LayoutCard:
+				spec.Width, spec.Height, spec.Fit = g.Card.W, g.Card.H, true
+			case planner.LayoutPIP:
+				spec.Width, spec.Height, spec.Fit = g.PIP.W, g.PIP.H, true
+			}
+			if e.Asset.Source == planner.SourceProcedure {
+				// Generated graphics are centred designs: fill the frame
+				// instead of shrinking them inside a blurred copy.
+				spec.Fit = false
+			}
+			clip := filepath.Join(parts, fmt.Sprintf("%s-%s.mp4", e.ID, e.Layout))
+			t0 := time.Now()
+			if err := PrepareClip(ctx, cfg, *e.Asset, spec, clip); err != nil {
+				logger.Warn("visual.render.event", "event", e.ID, "prepare_failed", true, "error", err, "fallback", planner.SourceSelfBroll)
+				it.self = true
+			} else {
+				logger.Debug("visual.render.prepare", "event", e.ID, "clip", clip, "duration_ms", time.Since(t0).Milliseconds())
+				args = append(args, "-i", clip)
+				it.clip = next
+				next++
+				if e.Layout == planner.LayoutCard || e.Layout == planner.LayoutPIP {
+					r := g.Card
+					if e.Layout == planner.LayoutPIP {
+						r = g.PIP
+					}
+					radius := g.Radius
+					if e.Layout == planner.LayoutPIP {
+						radius = 26
+					}
+					maskP := filepath.Join(parts, fmt.Sprintf("mask-%dx%d.png", r.W, r.H))
+					shadowP := filepath.Join(parts, fmt.Sprintf("shadow-%dx%d.png", r.W, r.H))
+					if err := WriteRoundedMask(maskP, r.W, r.H, radius); err != nil {
+						return err
+					}
+					if err := WriteShadow(shadowP, r.W, r.H, radius, g.ShadowPad, 0.55); err != nil {
+						return err
+					}
+					for _, p := range []string{maskP, shadowP} {
+						args = append(args, "-loop", "1", "-framerate", strconv.Itoa(fps), "-t", fmt.Sprintf("%.3f", dur), "-i", p)
+					}
+					it.mask, it.shadow = next, next+1
+					next += 2
+				}
+			}
 		}
-		ovs = append(ovs, ov{event: e, idx: idx, isVideo: isVideo})
+		if it.self {
+			lf := filepath.Join(parts, e.ID+"-label.txt")
+			label := strings.ToUpper(strings.TrimSpace(firstNonEmpty(e.Label, e.Concept, "CONTEXTO")))
+			if err := os.WriteFile(lf, []byte(label), 0644); err != nil {
+				return err
+			}
+			it.labelFile = lf
+		}
+		items = append(items, it)
 	}
 
 	var fc strings.Builder
-	base := "[0:v]"
-	fmt.Fprintf(&fc, "%sscale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1,eq=contrast=1.03:saturation=1.04,unsharp=5:5:0.25,fps=%d", base, cfg.Output.Width, cfg.Output.Height, cfg.Output.Width, cfg.Output.Height, cfg.Output.FPS)
+	fmt.Fprintf(&fc, "[0:v]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1,eq=contrast=1.03:saturation=1.04,unsharp=5:5:0.25,fps=%d", W, H, W, H, fps)
 	if cfg.Zoom.Enabled && len(plan.Zooms) > 0 {
-		expr := zoomExpr(plan.Zooms, cfg.Output.FPS)
-		fmt.Fprintf(&fc, ",zoompan=z='%s':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=%dx%d:fps=%d", expr, cfg.Output.Width, cfg.Output.Height, cfg.Output.FPS)
+		focus := cfg.Broll.ReactionFocusY
+		if focus <= 0 || focus >= 1 {
+			focus = 0.4
+		}
+		fmt.Fprintf(&fc, ",zoompan=z='%s':x='iw/2-(iw/zoom/2)':y='%.3f*(ih-ih/zoom)':d=1:s=%dx%d:fps=%d", ZoomExpr(plan.Zooms, fps), focus, W, H, fps)
 	}
 	fc.WriteString("[v0];")
 	prev := "[v0]"
-
-	// Real visual assets: video is preferred. Still images get a Ken Burns push
-	// so even an image feels like B-roll rather than a frozen card.
-	for i, o := range ovs {
-		e := o.event
-		dur := e.End - e.Start
-		if dur <= 0 {
-			continue
-		}
-		mode := e.Mode
-		if mode == "bottom" {
-			mode = "reaction"
-		}
-		prep := fmt.Sprintf("[br%d]", i)
-		fadeOut := dur - 0.16
-		if fadeOut < 0.18 {
-			fadeOut = dur * 0.55
-		}
-
-		panelH := int(float64(cfg.Output.Height) * 0.48)
-		if mode == "fullscreen" {
-			panelH = cfg.Output.Height
-		} else if mode == "card" {
-			panelH = int(float64(cfg.Output.Height) * 0.30)
-		}
-		panelW := cfg.Output.Width
-		if mode == "card" {
-			panelW = int(float64(cfg.Output.Width) * 0.86)
-		}
-
-		if o.isVideo {
-			fmt.Fprintf(&fc, "[%d:v]trim=duration=%.3f,setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,fps=%d,eq=contrast=1.05:saturation=1.08,format=rgba,fade=t=in:st=0:d=0.10:alpha=1,fade=t=out:st=%.3f:d=0.16:alpha=1,setpts=PTS+%.3f/TB%s;",
-				o.idx, dur, panelW, panelH, panelW, panelH, cfg.Output.FPS, fadeOut, e.Start, prep)
-		} else {
-			// Scale a little larger and move slowly for a subtle Ken Burns effect.
-			fmt.Fprintf(&fc, "[%d:v]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,zoompan=z='min(zoom+0.0012,1.075)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=%dx%d:fps=%d,format=rgba,fade=t=in:st=0:d=0.10:alpha=1,fade=t=out:st=%.3f:d=0.16:alpha=1,setpts=PTS+%.3f/TB%s;",
-				o.idx, panelW, panelH, panelW, panelH, panelW, panelH, cfg.Output.FPS, fadeOut, e.Start, prep)
-		}
-
-		next := fmt.Sprintf("[vbr%d]", i)
-		x, y := "0", "H-h"
-		if mode == "card" {
-			x = "(W-w)/2"
-			y = "H-h-190"
-		} else if mode == "fullscreen" {
-			y = "0"
-		} else if e.Position == "top" {
-			y = "0"
-		}
-		fmt.Fprintf(&fc, "%s%s overlay=%s:%s:eof_action=pass:shortest=0:enable='between(t,%.3f,%.3f)'%s;", prev, prep, x, y, e.Start, e.End, next)
-		prev = next
-
-		// Reaction split gets a branded separator so the composition reads as an
-		// intentional two-source edit, like podcast/react Shorts.
-		if mode == "reaction" {
-			lineY := cfg.Output.Height - panelH
-			lined := fmt.Sprintf("[vline%d]", i)
-			fmt.Fprintf(&fc, "%sdrawbox=x=0:y=%d:w=%d:h=7:color=0xFFD700@0.95:t=fill:enable='between(t,%.3f,%.3f)'%s;", prev, lineY, cfg.Output.Width, e.Start, e.End, lined)
-			prev = lined
-		}
-		logger.Info("visual.effect.render", "type", "broll", "keyword", e.Keyword, "mode", mode, "media_type", map[bool]string{true: "video", false: "image"}[o.isVideo], "start", e.Start, "end", e.End, "asset", e.Asset)
+	font := assets.DrawtextFont()
+	hasDrawtext := assets.FFmpegHasFilter(cfg.FFmpeg, "drawtext")
+	if !hasDrawtext {
+		logger.Warn("visual.render.capability", "ffmpeg", cfg.FFmpeg, "drawtext", false, "effect", "self-broll sem rótulo; instale ffmpeg-full")
 	}
 
-	// If remote/local media could not be resolved, create an animated self-B-roll
-	// split instead of a static black rectangle. It is intentionally a fallback:
-	// debug.log still records self-broll so missing assets remain visible.
-	fallbackN := 0
-	for _, e := range plan.Overlays {
-		if strings.TrimSpace(e.Asset) != "" {
-			continue
+	for i, it := range items {
+		e := it.e
+		s, en := e.Start, e.End
+		dur := en - s
+		enable := fmt.Sprintf("enable='between(t,%.3f,%.3f)'", s, en)
+		fadeOut := math.Max(0.05, dur-0.12)
+		lbl := func(name string) string { return fmt.Sprintf("[%s%d]", name, i) }
+		// splitTop reframes the creator into the top panel (hard cut in/out).
+		splitTop := func() {
+			fmt.Fprintf(&fc, "%ssplit=2%s%s;", prev, lbl("ma"), lbl("mb"))
+			fmt.Fprintf(&fc, "%scrop=%d:%d:0:%d,setsar=1%s;", lbl("mb"), W, g.Split, g.CropY, lbl("top"))
+			fmt.Fprintf(&fc, "%s%soverlay=0:0:%s%s;", lbl("ma"), lbl("top"), enable, lbl("m1"))
+			prev = lbl("m1")
 		}
-		panelH := int(float64(cfg.Output.Height) * 0.46)
-		mainLabel := fmt.Sprintf("[fbmain%d]", fallbackN)
-		srcLabel := fmt.Sprintf("[fbsrc%d]", fallbackN)
-		panelLabel := fmt.Sprintf("[fbpanel%d]", fallbackN)
-		next := fmt.Sprintf("[vfb%d]", fallbackN)
-		text := strings.ToUpper(strings.TrimSpace(e.Keyword))
-		if text == "" {
-			text = "CONTEXTO"
+		mediaType := "video"
+		if e.Asset != nil && e.Asset.Type != "" {
+			mediaType = e.Asset.Type
 		}
-		// split current frame -> duplicate lower panel -> strong crop/blur/dim -> overlay
-		fmt.Fprintf(&fc, "%ssplit=2%s%s;", prev, mainLabel, srcLabel)
-		fmt.Fprintf(&fc, "%scrop=iw:ih*0.46:0:ih*0.27,scale=%d:%d,boxblur=12:2,eq=brightness=-0.18:saturation=1.25,format=rgba%s;", srcLabel, cfg.Output.Width, panelH, panelLabel)
-		fmt.Fprintf(&fc, "%s%soverlay=0:H-h:enable='between(t,%.3f,%.3f)',drawbox=x=0:y=%d:w=%d:h=7:color=0xFFD700@0.95:t=fill:enable='between(t,%.3f,%.3f)',drawtext=font='Arial':text='%s':fontcolor=white:fontsize=56:borderw=3:bordercolor=black@0.9:x=(w-text_w)/2:y=%d:enable='between(t,%.3f,%.3f)'%s;",
-			mainLabel, panelLabel, e.Start, e.End, cfg.Output.Height-panelH, cfg.Output.Width, e.Start, e.End, escapeDrawText(text), cfg.Output.Height-panelH+70, e.Start, e.End, next)
-		prev = next
-		fallbackN++
-		logger.Info("visual.effect.render", "type", "self-broll-fallback", "keyword", e.Keyword, "start", e.Start, "end", e.End)
+		switch {
+		case it.self:
+			splitTop()
+			fmt.Fprintf(&fc, "%ssplit=2%s%s;", prev, lbl("sa"), lbl("sb"))
+			fmt.Fprintf(&fc, "%scrop=%d:%d:0:%d,boxblur=16:2,eq=brightness=-0.22:saturation=1.2,setsar=1%s;", lbl("sb"), W, H-g.Split, g.Split/2, lbl("sp"))
+			label := ""
+			if hasDrawtext {
+				label = fmt.Sprintf(",drawtext=textfile='%s':%s:fontsize=78:fontcolor=white:borderw=5:bordercolor=black@0.85:x=(w-text_w)/2:y=%d:%s",
+					escapeFilterPathQuoted(it.labelFile), font, g.Split+(H-g.Split)/2-40, enable)
+			}
+			fmt.Fprintf(&fc, "%s%soverlay=0:%d:%s%s%s;", lbl("sa"), lbl("sp"), g.Split, enable, label, lbl("v"))
+		case e.Layout == planner.LayoutFullscreen:
+			fmt.Fprintf(&fc, "[%d:v]format=yuva420p,fade=t=in:st=0:d=0.12:alpha=1,fade=t=out:st=%.3f:d=0.12:alpha=1,setpts=PTS-STARTPTS+%.3f/TB%s;", it.clip, fadeOut, s, lbl("b"))
+			fmt.Fprintf(&fc, "%s%soverlay=0:0:eof_action=pass:%s%s;", prev, lbl("b"), enable, lbl("v"))
+		case e.Layout == planner.LayoutCard || e.Layout == planner.LayoutPIP:
+			r := g.Card
+			if e.Layout == planner.LayoutCard {
+				splitTop()
+				fmt.Fprintf(&fc, "%sdrawbox=x=0:y=%d:w=%d:h=%d:color=0x0E0F14@0.94:t=fill:%s%s;", prev, g.Split, W, H-g.Split, enable, lbl("dk"))
+				prev = lbl("dk")
+			} else {
+				r = g.PIP
+			}
+			slide := fmt.Sprintf("%d+42*max(0\\,1-(t-%.3f)/0.22)", r.Y, s)
+			fmt.Fprintf(&fc, "[%d:v]format=rgba%s;[%d:v]format=gray%s;%s%salphamerge,fade=t=in:st=0:d=0.14:alpha=1,fade=t=out:st=%.3f:d=0.12:alpha=1,setpts=PTS-STARTPTS+%.3f/TB%s;",
+				it.clip, lbl("c"), it.mask, lbl("k"), lbl("c"), lbl("k"), fadeOut, s, lbl("card"))
+			fmt.Fprintf(&fc, "[%d:v]format=rgba,fade=t=in:st=0:d=0.14:alpha=1,fade=t=out:st=%.3f:d=0.12:alpha=1,setpts=PTS-STARTPTS+%.3f/TB%s;", it.shadow, fadeOut, s, lbl("sh"))
+			shadowY := fmt.Sprintf("%d+42*max(0\\,1-(t-%.3f)/0.22)", r.Y-g.ShadowPad+14, s)
+			fmt.Fprintf(&fc, "%s%soverlay=x=%d:y='%s':eof_action=pass:%s%s;", prev, lbl("sh"), r.X-g.ShadowPad, shadowY, enable, lbl("m2"))
+			fmt.Fprintf(&fc, "%s%soverlay=x=%d:y='%s':eof_action=pass:%s%s;", lbl("m2"), lbl("card"), r.X, slide, enable, lbl("v"))
+		default: // reaction
+			splitTop()
+			fmt.Fprintf(&fc, "[%d:v]format=yuva420p,fade=t=in:st=0:d=0.12:alpha=1,fade=t=out:st=%.3f:d=0.12:alpha=1,setpts=PTS-STARTPTS+%.3f/TB%s;", it.clip, fadeOut, s, lbl("b"))
+			fmt.Fprintf(&fc, "%s%soverlay=0:%d:eof_action=pass:%s,drawbox=x=0:y=%d:w=%d:h=4:color=white@0.85:t=fill:%s%s;", prev, lbl("b"), g.Split, enable, g.Split-2, W, enable, lbl("v"))
+		}
+		prev = lbl("v")
+		source := ""
+		if e.Asset != nil {
+			source = e.Asset.Source
+		}
+		logger.Info("visual.render.event", "event", e.ID, "layout", e.Layout, "type", e.Type, "concept", e.Concept, "source", source, "media_type", mediaType, "self_broll", it.self, "start", s, "end", en)
 	}
 
-	assEsc := escapeFilterPath(assPath)
+	// Captions are burned last so no B-roll ever covers them.
 	if cfg.Captions.Enabled && assPath != "" {
-		fmt.Fprintf(&fc, "%sass='%s'[vout]", prev, assEsc)
+		fmt.Fprintf(&fc, "%sass='%s'[vout]", prev, escapeFilterPath(assPath))
 	} else {
 		fmt.Fprintf(&fc, "%snull[vout]", prev)
 	}
 
-	// Generated SFX are subtle and free/local. They sit under speech.
 	audioMap := "0:a?"
 	if hasAudio && len(plan.SFX) > 0 {
 		labels := []string{"[0:a]"}
-		for i, s := range plan.SFX {
+		for i, sfx := range plan.SFX {
 			label := fmt.Sprintf("[sfx%d]", i)
-			delay := int(s.Time * 1000)
-			gain := s.GainDB
-			if gain == 0 {
-				gain = -24
-			}
-			if s.Name == "whoosh" {
-				fmt.Fprintf(&fc, ";anoisesrc=color=pink:sample_rate=48000:duration=0.28,highpass=f=500,lowpass=f=6000,volume=%.1fdB,afade=t=in:st=0:d=0.035,afade=t=out:st=0.11:d=0.16,adelay=%d|%d%s", gain, delay, delay, label)
-			} else {
-				fmt.Fprintf(&fc, ";sine=frequency=920:sample_rate=48000:duration=0.09,volume=%.1fdB,afade=t=out:st=0.035:d=0.055,adelay=%d|%d%s", gain, delay, delay, label)
-			}
+			delay := int(math.Round(sfx.Time * 1000))
+			gain := ClampSFXGain(sfx.GainDB)
+			fmt.Fprintf(&fc, ";%s,volume=%.1fdB,adelay=%d|%d%s", sfxSource(sfx.Name), gain, delay, delay, label)
 			labels = append(labels, label)
-			logger.Info("audio.sfx.render", "name", s.Name, "time", s.Time, "gain_db", gain)
+			logger.Info("audio.sfx.event", "name", sfx.Name, "time", sfx.Time, "gain_db", gain, "reason", sfx.Reason)
 		}
 		fmt.Fprintf(&fc, ";%samix=inputs=%d:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]", strings.Join(labels, ""), len(labels))
 		audioMap = "[aout]"
@@ -210,9 +247,77 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 	if !(hasAudio && len(plan.SFX) > 0) {
 		args = append(args, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11")
 	}
-	args = append(args, "-c:v", "libx264", "-preset", cfg.Output.Preset, "-crf", strconv.Itoa(cfg.Output.CRF), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", cfg.Output.AudioBitrate, "-movflags", "+faststart", "-shortest", output)
-	_, err := execx.Run(ctx, nil, cfg.FFmpeg, args...)
-	return err
+	args = append(args, "-r", strconv.Itoa(fps), "-c:v", "libx264", "-profile:v", "high", "-preset", cfg.Output.Preset, "-crf", strconv.Itoa(cfg.Output.CRF), "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-b:a", cfg.Output.AudioBitrate, "-ar", "48000", "-movflags", "+faststart", "-shortest", output)
+	if _, err := execx.Run(ctx, nil, cfg.FFmpeg, args...); err != nil {
+		return err
+	}
+	logger.Info("visual.render.complete", "output", output, "events_rendered", len(items), "duration_ms", time.Since(started).Milliseconds())
+	return nil
+}
+
+// ClampSFXGain keeps sound design discreet: -28..-18 dB under the voice.
+func ClampSFXGain(g float64) float64 {
+	if g == 0 {
+		g = -24
+	}
+	return math.Max(-28, math.Min(-18, g))
+}
+
+func sfxSource(name string) string {
+	switch name {
+	case "whoosh":
+		return "anoisesrc=color=pink:sample_rate=48000:duration=0.30,highpass=f=500,lowpass=f=6000,afade=t=in:st=0:d=0.05,afade=t=out:st=0.12:d=0.17"
+	case "click":
+		return "sine=frequency=2600:sample_rate=48000:duration=0.03,afade=t=out:st=0.005:d=0.025"
+	case "beep", "error":
+		return "sine=frequency=1000:sample_rate=48000:duration=0.14,afade=t=in:st=0:d=0.01,afade=t=out:st=0.09:d=0.05"
+	default: // pop
+		return "sine=frequency=920:sample_rate=48000:duration=0.09,afade=t=out:st=0.035:d=0.055"
+	}
+}
+
+func firstNonEmpty(xs ...string) string {
+	for _, x := range xs {
+		if strings.TrimSpace(x) != "" {
+			return x
+		}
+	}
+	return ""
+}
+
+// ZoomExpr builds the zoompan z expression (output frame based). Each kind
+// has its own curve; scales are clamped to tasteful ranges by the planner.
+func ZoomExpr(zs []planner.ZoomEvent, fps int) string {
+	expr := "1.0"
+	sorted := append([]planner.ZoomEvent(nil), zs...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Start < sorted[j].Start })
+	for i := len(sorted) - 1; i >= 0; i-- {
+		z := sorted[i]
+		a := int(math.Round(z.Start * float64(fps)))
+		b := int(math.Round(z.End * float64(fps)))
+		if b <= a+1 {
+			continue
+		}
+		L := b - a
+		delta := z.Scale - 1.0
+		var curve string
+		switch z.Kind {
+		case planner.ZoomSlowPush:
+			// smooth push-in across the whole interval
+			curve = fmt.Sprintf("(0.5-0.5*cos(PI*(on-%d)/%d))", a, L)
+		case planner.ZoomReframe:
+			curve = "1"
+		default: // punch_zoom: fast ease-in, hold, quick release
+			at := int(math.Max(2, math.Min(0.15*float64(fps), 0.3*float64(L))))
+			rl := int(math.Max(2, math.Min(0.18*float64(fps), 0.3*float64(L))))
+			up := fmt.Sprintf("(on-%d)/%d", a, at)
+			down := fmt.Sprintf("(%d-on)/%d", b, rl)
+			curve = fmt.Sprintf("if(lt(on,%d),%s*%s*(3-2*%s),if(gt(on,%d),%s*%s*(3-2*%s),1))", a+at, up, up, up, b-rl, down, down, down)
+		}
+		expr = fmt.Sprintf("if(between(on,%d,%d),1+%.4f*%s,%s)", a, b, delta, curve, expr)
+	}
+	return expr
 }
 
 func isVideoPath(p string) bool {
@@ -224,27 +329,19 @@ func isVideoPath(p string) bool {
 	}
 }
 
-func zoomExpr(zs []planner.ZoomEvent, fps int) string {
-	expr := "1.0"
-	for i := len(zs) - 1; i >= 0; i-- {
-		a := int(zs[i].Start * float64(fps))
-		b := int(zs[i].End * float64(fps))
-		if b <= a {
-			continue
-		}
-		// Smooth in/out instead of an abrupt digital zoom jump.
-		delta := zs[i].Scale - 1.0
-		expr = fmt.Sprintf("if(between(on,%d,%d),1+%.5f*(0.5-0.5*cos(2*PI*(on-%d)/(%d-%d))),%s)", a, b, delta, a, b, a, expr)
-	}
-	return expr
-}
-
 func escapeFilterPath(p string) string {
 	p, _ = filepath.Abs(p)
 	p = strings.ReplaceAll(p, "\\", "/")
 	p = strings.ReplaceAll(p, "'", "\\'")
 	p = strings.ReplaceAll(p, ":", "\\:")
 	return p
+}
+
+// escapeFilterPathQuoted is for values inside single quotes in a filtergraph.
+func escapeFilterPathQuoted(p string) string {
+	p, _ = filepath.Abs(p)
+	p = strings.ReplaceAll(p, "\\", "/")
+	return strings.ReplaceAll(p, "'", "'\\''")
 }
 
 func escapeDrawText(s string) string {

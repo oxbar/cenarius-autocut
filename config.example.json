@@ -17,6 +17,8 @@
   "output": {"width":1080,"height":1920,"fps":30,"crf":18,"preset":"medium","audio_bitrate":"192k"},
   "cuts": {"enabled":true,"noise_db":-42,"min_silence":1.10,"keep_silence":0.25,"min_keep_segment":0.20},
   "captions": {"enabled":true,"font_name":"Arial","font_size":82,"primary_color":"&H00FFFFFF","highlight_color":"&H0000D7FF","outline_color":"&H00000000","outline":6,"shadow":0,"margin_v":560,"safe_margin":96,"max_words":6,"max_chars_per_line":24,"max_lines":2,"uppercase":true,"active_word":true},
-  "zoom": {"enabled":true,"mild":1.035,"punch":1.08,"min_gap":5.0,"duration":1.0},
-  "broll": {"enabled":true,"asset_dir":"./assets/broll","manifest":"./assets/manifest.json","max_events":3}
+  "zoom": {"enabled":true,"mild":1.06,"emphasis":1.085,"punch":1.10,"min_gap":4.0,"duration":0.85},
+  "broll": {"enabled":true,"asset_dir":"./assets/broll","manifest":"./assets/manifest.json","max_events":5,
+            "min_visual_gap":0.35,"remote":true,"procedural":true,"allow_self_broll":true,"max_remote_mb":60,
+            "reaction_split":0.5,"reaction_focus_y":0.40,"seam_captions":true}
 }

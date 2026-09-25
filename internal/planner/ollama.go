@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,256 +17,328 @@ import (
 	"cenarius-autocut/internal/transcribe"
 )
 
+// DirectorResponse is the strict JSON contract asked from the LLM. The model
+// never writes FFmpeg; it only returns editorial intent that Go validates.
+type DirectorResponse struct {
+	Hook         string          `json:"hook"`
+	CTA          string          `json:"cta"`
+	VisualEvents []directorEvent `json:"visual_events"`
+	Zooms        []ZoomEvent     `json:"zooms"`
+	Emphasis     []string        `json:"emphasis"`
+	// Legacy (v1.5) answers are still understood.
+	Overlays []OverlayEvent `json:"overlays"`
+}
+
+type directorEvent struct {
+	UnitID     string   `json:"unit_id"`
+	Start      float64  `json:"start"`
+	End        float64  `json:"end"`
+	Type       string   `json:"type"`
+	Concept    string   `json:"concept"`
+	Queries    []string `json:"queries"`
+	Query      string   `json:"query"`
+	Layout     string   `json:"layout"`
+	Importance float64  `json:"importance"`
+	Reason     string   `json:"reason"`
+}
+
+const directorPrompt = `Você é o DIRETOR EDITORIAL de Reels/TikTok/Shorts em português brasileiro. Você decide INTENÇÃO editorial; não escreve comandos de vídeo.
+
+O vídeo é um creator falando para a câmera (A-roll). Você decide quando inserir B-roll REAL (vídeo/foto de banco livre), cards, cutaways fullscreen e zooms, sempre com motivo semântico.
+
+Responda SOMENTE com JSON válido, sem markdown, sem texto extra, exatamente neste formato:
+{"hook":"frase do gancho","cta":"frase de CTA ou vazio",
+ "visual_events":[{"unit_id":"u02","start":3.2,"end":5.6,"type":"broll","concept":"software development","queries":["software developer programming computer","programmer coding","source code on computer screen"],"layout":"reaction","importance":0.82,"reason":"ilustra diretamente a explicação"}],
+ "zooms":[{"start":0.0,"end":0.9,"kind":"punch_zoom","scale":1.08,"reason":"gancho"}],
+ "emphasis":["PALAVRA"]}
+
+REGRAS:
+- Analise cada unidade com a anterior e a seguinte: gancho, explicação, exemplo, punchline, mudança de ideia, CTA, emoção.
+- Vídeo de 20-30s: 3 a 5 visual_events no total. Nunca mais de 6. Não deixe mais de ~7s sem mudança visual se houver ideia visualizável.
+- visual_events NÃO podem se sobrepor. Deixe pelo menos 0.4s de A-roll entre eles.
+- O primeiro segundo é do creator (sem B-roll antes de 1.2s); use punch_zoom 1.07-1.10 no gancho.
+- type: "broll" (vídeo/foto contextual), "card" (logo, print, interface, entidade), "pip" (imagem pequena).
+- layout: "reaction" (creator em cima, B-roll embaixo — preferido), "fullscreen" (cutaway de 1.2-2.5s, bom para punchline), "card", "pip".
+- Duração: reaction 1.6-3.0s; fullscreen 1.2-2.5s; card 1.6-2.8s.
+- queries: 2 a 4 buscas CONCRETAS em inglês, do mais específico ao mais genérico, que existam como foto/vídeo em banco livre (ex.: "programmer coding", "data center servers"). Nunca abstratas ("sucesso", "futuro"). Não invente fatos nem pessoas.
+- concept: nome curto em inglês do que será mostrado.
+- importance 0-1: conceito central da fala > menção de passagem.
+- zooms: kind "punch_zoom" (ênfase, 1.08-1.12), "slow_push" (explicação longa, 1.055-1.07), "reframe" (mudança de ideia, 1.06-1.08). No máximo 4. Não coloque zoom dentro de fullscreen.
+- emphasis: no máximo 3 palavras que devem ser destacadas na legenda.
+- Use os tempos exatos das palavras.
+
+UNIDADES SEMÂNTICAS (id, início, fim, papel sugerido, conceitos detectados, texto):
+%s
+
+PALAVRAS COM TIMESTAMPS (w=palavra, t=início, e=fim, segundos):
+%s`
+
+var thinkRE = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+// WithOllama asks the local LLM to act as editorial director. Any failure
+// (disabled, offline, HTTP error, invalid JSON, empty/invalid events) falls
+// back to the heuristic plan; the pipeline is never interrupted.
 func WithOllama(ctx context.Context, base Plan, tr transcribe.Transcript, cfg config.Config) Plan {
 	logger := logx.From(ctx)
 	if !cfg.Ollama.Enabled {
-		logger.Info("planner.ollama.skip", "reason", "disabled")
+		logger.Info("planner.fallback", "reason", "ollama disabled", "using", "heuristic")
 		return base
 	}
-	transcriptJSON := compactTranscriptJSON(tr)
-	prompt := `Você é um diretor e editor profissional de Reels/Shorts. Seu trabalho NÃO é só colocar legendas: você cria ritmo visual como um editor humano, usando o apresentador como A-roll e inserindo B-roll real quando ele aumenta compreensão/retenção.
-
-Devolva SOMENTE JSON válido:
-{"zooms":[{"start":0.0,"end":0.8,"scale":1.07,"reason":"gancho"}],"overlays":[{"start":2.0,"end":4.5,"keyword":"programação","query":"software developer coding computer screen","position":"bottom","mode":"reaction","reason":"B-roll contextual"}],"sfx":[{"time":2.0,"name":"whoosh","gain_db":-24,"reason":"entrada B-roll"}],"emphasis":["PALAVRA"]}.
-
-REGRAS DE DIREÇÃO:
-- Vídeo de 20-30s deve ter normalmente 2-4 mudanças visuais relevantes, espaçadas ~3-7s, se a fala permitir.
-- Não invente fatos. Você PODE escolher B-roll atmosférico que represente um conceito falado (ex.: tecnologia -> software developer coding; mundo + tecnologia -> global digital network).
-- O primeiro segundo precisa de um punch zoom perceptível (1.06-1.10), sem exagero.
-- Use mode=reaction para colocar B-roll em movimento na metade inferior enquanto o apresentador continua visível em cima, estilo react/podcast. Esse é o modo preferido.
-- Use mode=fullscreen por 1.0-1.8s para uma cutaway forte.
-- Use mode=card apenas para logo, print/interface ou entidade que funcione melhor como card.
-- query deve descrever IMAGENS/VÍDEOS concretos pesquisáveis, de preferência em inglês. Nunca use query abstrata.
-- Não repita a mesma query/keyword.
-- Em fala genérica, prefira cenas de computador, programação, smartphone, data center, rede digital, creator gravando, conforme o trecho realmente disser.
-- SFX: whoosh em reaction/fullscreen; pop em card. No máximo 4, ganho -30 a -18dB.
-- Zoom: 2-4 no máximo. Em punchline/mudança, 1.08-1.12. Em transição suave, 1.04-1.07.
-- overlay deve durar 1.4-3.0s.
-- Não deixe 8+ segundos sem alguma mudança visual se houver uma ideia visualizável.
-- Destaque no máximo 3 palavras importantes.
-
-A transcrição abaixo traz palavras com timestamps em segundos. Use esses tempos com precisão:
-` + transcriptJSON
-	reqBody, _ := json.Marshal(map[string]any{"model": cfg.Ollama.Model, "prompt": prompt, "stream": false, "format": "json"})
+	units := base.SemanticUnits
+	if len(units) == 0 {
+		units = BuildUnits(tr)
+	}
+	prompt := fmt.Sprintf(directorPrompt, unitsForPrompt(units), compactTranscriptJSON(tr))
+	body := map[string]any{
+		"model": cfg.Ollama.Model, "prompt": prompt, "stream": false, "format": "json", "think": false,
+		"options": map[string]any{"temperature": 0.3, "num_ctx": 8192},
+	}
+	reqBody, _ := json.Marshal(body)
+	logger.Info("planner.ollama.request", "model", cfg.Ollama.Model, "url", cfg.Ollama.URL, "units", len(units), "prompt_chars", len(prompt))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.Ollama.URL, "/")+"/api/generate", bytes.NewReader(reqBody))
 	if err != nil {
-		logger.Warn("planner.ollama.error", "error", err)
+		logger.Warn("planner.fallback", "reason", err, "using", "heuristic")
 		return base
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 2 * time.Minute}
+	client := &http.Client{Timeout: 3 * time.Minute}
 	started := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Warn("planner.ollama.unavailable", "error", err, "duration_ms", time.Since(started).Milliseconds())
+		logger.Warn("planner.fallback", "reason", "ollama unavailable", "error", err, "duration_ms", time.Since(started).Milliseconds(), "using", "heuristic")
 		return base
 	}
 	defer resp.Body.Close()
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode/100 != 2 {
-		logger.Warn("planner.ollama.http_error", "status", resp.Status)
+		logger.Warn("planner.fallback", "reason", "ollama http "+resp.Status, "body", string(rb), "using", "heuristic")
 		return base
 	}
-	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	var wrap struct {
 		Response string `json:"response"`
 	}
 	if json.Unmarshal(rb, &wrap) != nil {
-		logger.Warn("planner.ollama.invalid_wrapper")
+		logger.Warn("planner.ollama.invalid", "reason", "invalid wrapper")
+		logger.Warn("planner.fallback", "reason", "ollama invalid wrapper", "using", "heuristic")
 		return base
 	}
+	logger.Info("planner.ollama.response", "duration_ms", time.Since(started).Milliseconds(), "chars", len(wrap.Response))
 	logger.Debug("planner.ollama.raw", "response", wrap.Response)
-	var p Plan
-	if err := json.Unmarshal([]byte(wrap.Response), &p); err != nil {
-		logger.Warn("planner.ollama.invalid_json", "error", err, "response", wrap.Response)
+
+	ai, err := ParseDirector(wrap.Response, tr, units, cfg)
+	if err != nil {
+		logger.Warn("planner.ollama.invalid", "error", err)
+		logger.Warn("planner.fallback", "reason", "ollama invalid plan", "using", "heuristic")
 		return base
 	}
-	sanitize(&p, tr, cfg)
-	logger.Info("planner.ollama.ok", "duration_ms", time.Since(started).Milliseconds(), "zooms", len(p.Zooms), "overlays", len(p.Overlays), "sfx", len(p.SFX))
-	return mergePlans(base, p, cfg)
-}
-
-func mergePlans(base, ai Plan, cfg config.Config) Plan {
-	// AI is the director. When it produced visual events, place them first and
-	// use heuristics only to fill remaining gaps. This avoids a generic heuristic
-	// overlay blocking a much better semantic B-roll decision at the same time.
-	out := Plan{}
-	for _, z := range ai.Zooms {
-		if !zoomNear(z, out.Zooms, .75) {
-			out.Zooms = append(out.Zooms, z)
-		}
+	merged := base
+	merged.VisualEvents = append(append([]VisualEvent(nil), ai.VisualEvents...), base.VisualEvents...)
+	merged.Emphasis = append(append([]string(nil), ai.Emphasis...), base.Emphasis...)
+	if ai.Hook != "" {
+		merged.Hook = ai.Hook
 	}
-	for _, z := range base.Zooms {
-		if len(out.Zooms) >= 4 {
-			break
-		}
-		if !zoomNear(z, out.Zooms, .75) {
-			out.Zooms = append(out.Zooms, z)
-		}
+	if ai.CTA != "" {
+		merged.CTA = ai.CTA
 	}
-	for _, o := range ai.Overlays {
-		if len(out.Overlays) >= cfg.Broll.MaxEvents {
-			break
-		}
-		if !overlayNear(o, out.Overlays, 1.1) {
-			out.Overlays = append(out.Overlays, o)
-		}
-	}
-	for _, o := range base.Overlays {
-		if len(out.Overlays) >= cfg.Broll.MaxEvents {
-			break
-		}
-		if !overlayNear(o, out.Overlays, 1.1) {
-			out.Overlays = append(out.Overlays, o)
-		}
-	}
-	for _, s := range ai.SFX {
-		if len(out.SFX) >= 4 {
-			break
-		}
-		if !sfxNear(s, out.SFX, .35) {
-			out.SFX = append(out.SFX, s)
-		}
-	}
-	for _, s := range base.SFX {
-		if len(out.SFX) >= 4 {
-			break
-		}
-		if !sfxNear(s, out.SFX, .35) {
-			out.SFX = append(out.SFX, s)
-		}
-	}
-	out.Emphasis = append(out.Emphasis, ai.Emphasis...)
-	for _, e := range base.Emphasis {
-		out.Emphasis = appendUnique(out.Emphasis, e)
-	}
-	sanitize(&out, transcribe.Transcript{}, cfg)
+	out := Finalize(ctx, merged, transcriptEnd(tr), cfg, ai.Zooms)
+	logger.Info("planner.ollama.ok", "ai_events", len(ai.VisualEvents), "ai_zooms", len(ai.Zooms), "final_events", len(out.VisualEvents), "final_zooms", len(out.Zooms))
 	return out
 }
 
-func zoomNear(z ZoomEvent, xs []ZoomEvent, gap float64) bool {
-	for _, x := range xs {
-		if abs(x.Start-z.Start) < gap {
-			return true
+// ParseDirector parses and validates the LLM answer. It returns an error when
+// nothing usable survives validation.
+func ParseDirector(raw string, tr transcribe.Transcript, units []SemanticUnit, cfg config.Config) (Plan, error) {
+	s := strings.TrimSpace(thinkRE.ReplaceAllString(raw, ""))
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "```json"), "```")
+	s = strings.TrimSpace(strings.TrimSuffix(s, "```"))
+	var d DirectorResponse
+	dec := json.NewDecoder(strings.NewReader(s))
+	if err := dec.Decode(&d); err != nil {
+		return Plan{}, fmt.Errorf("json inválido: %w", err)
+	}
+	dur := transcriptEnd(tr)
+	if dur <= 0 {
+		return Plan{}, fmt.Errorf("transcrição vazia")
+	}
+	p := Plan{Hook: strings.TrimSpace(d.Hook), CTA: strings.TrimSpace(d.CTA)}
+	for _, o := range d.Overlays {
+		d.VisualEvents = append(d.VisualEvents, directorEvent{Start: o.Start, End: o.End, Concept: o.Keyword, Query: o.Query, Layout: o.Mode, Reason: o.Reason, Importance: 0.65})
+	}
+	wordStarts := make([]float64, 0, len(tr.Tokens))
+	for _, t := range tr.Tokens {
+		wordStarts = append(wordStarts, t.Start)
+	}
+	for _, e := range d.VisualEvents {
+		ve, ok := validateDirectorEvent(e, dur, wordStarts, units)
+		if ok {
+			p.VisualEvents = append(p.VisualEvents, ve)
 		}
 	}
-	return false
-}
-func overlayNear(o OverlayEvent, xs []OverlayEvent, gap float64) bool {
-	for _, x := range xs {
-		if strings.EqualFold(x.Keyword, o.Keyword) || abs(x.Start-o.Start) < gap {
-			return true
+	for _, z := range d.Zooms {
+		if math.IsNaN(z.Start) || math.IsNaN(z.End) || z.End <= z.Start || z.Start < 0 || z.Start > dur {
+			continue
 		}
-	}
-	return false
-}
-func sfxNear(s SFXEvent, xs []SFXEvent, gap float64) bool {
-	for _, x := range xs {
-		if abs(x.Time-s.Time) < gap {
-			return true
+		switch z.Kind {
+		case ZoomPunch, ZoomSlowPush, ZoomReframe:
+		case "", "punch", "zoom":
+			z.Kind = ZoomPunch
+		case "push", "slow push", "slow_push_in":
+			z.Kind = ZoomSlowPush
+		default:
+			continue
 		}
-	}
-	return false
-}
-func abs(v float64) float64 {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-
-func sanitize(p *Plan, tr transcribe.Transcript, cfg config.Config) {
-	maxT := transcriptEnd(tr)
-	if maxT <= 0 {
-		// Called during merging where all base events have already been bounded.
-		maxT = 60 * 60
-	}
-	zs := p.Zooms[:0]
-	for _, z := range p.Zooms {
-		if len(zs) >= 4 {
+		if z.End-z.Start > 3.5 {
+			z.End = z.Start + 3.5
+		}
+		z.Scale = ClampZoomScale(z.Kind, z.Scale)
+		if z.Reason == "" {
+			z.Reason = "diretor"
+		}
+		p.Zooms = append(p.Zooms, z)
+		if len(p.Zooms) >= 4 {
 			break
 		}
-		if z.Scale < 1.0 {
-			z.Scale = 1.0
-		}
-		if z.Scale > 1.12 {
-			z.Scale = 1.12
-		}
-		if z.Start < 0 {
-			z.Start = 0
-		}
-		if z.End > maxT {
-			z.End = maxT
-		}
-		if z.End > z.Start+0.15 {
-			zs = append(zs, z)
+	}
+	for _, w := range d.Emphasis {
+		w = strings.TrimSpace(w)
+		if w != "" && len([]rune(w)) <= 30 && len(p.Emphasis) < 3 {
+			p.Emphasis = appendUnique(p.Emphasis, w)
 		}
 	}
-	p.Zooms = zs
+	if len(p.VisualEvents) == 0 && len(p.Zooms) == 0 {
+		return Plan{}, fmt.Errorf("nenhum visual_event/zoom válido (recebidos %d eventos)", len(d.VisualEvents))
+	}
+	return p, nil
+}
 
-	os := p.Overlays[:0]
+var letterRE = regexp.MustCompile(`\pL{3,}`)
+
+func validateDirectorEvent(e directorEvent, dur float64, wordStarts []float64, units []SemanticUnit) (VisualEvent, bool) {
+	if math.IsNaN(e.Start) || math.IsNaN(e.End) || e.End <= e.Start || e.Start < 0 || e.Start >= dur {
+		return VisualEvent{}, false
+	}
+	layout := strings.ToLower(strings.TrimSpace(e.Layout))
+	switch layout {
+	case LayoutReaction, LayoutFullscreen, LayoutCard, LayoutPIP:
+	case "bottom", "split", "split_screen", "split-screen", "":
+		layout = LayoutReaction
+	case "cutaway", "full":
+		layout = LayoutFullscreen
+	default:
+		return VisualEvent{}, false
+	}
+	typ := strings.ToLower(strings.TrimSpace(e.Type))
+	switch {
+	case layout == LayoutCard:
+		typ = TypeCard
+	case layout == LayoutPIP:
+		typ = TypePIP
+	case typ != TypeBroll && typ != TypeCard && typ != TypeMotion:
+		typ = TypeBroll
+	}
+	var qs []string
 	seen := map[string]bool{}
-	for _, o := range p.Overlays {
-		o.Keyword = strings.TrimSpace(o.Keyword)
-		o.Query = strings.TrimSpace(o.Query)
-		if o.Query == "" {
-			o.Query = o.Keyword
+	addQ := func(q string) {
+		q = strings.Join(strings.Fields(q), " ")
+		k := strings.ToLower(q)
+		if q == "" || len(q) > 90 || seen[k] || !letterRE.MatchString(q) || len(qs) >= 5 {
+			return
 		}
-		if o.Start < 0 {
-			o.Start = 0
-		}
-		if o.End > maxT {
-			o.End = maxT
-		}
-		if o.End-o.Start > 3.0 {
-			o.End = o.Start + 3.0
-		}
-		if o.Mode != "bottom" && o.Mode != "reaction" && o.Mode != "fullscreen" && o.Mode != "card" {
-			o.Mode = "bottom"
-		}
-		if o.Position != "top" && o.Position != "bottom" {
-			o.Position = "bottom"
-		}
-		key := strings.ToLower(o.Keyword)
-		if o.Keyword != "" && o.End > o.Start+0.45 && !seen[key] {
-			os = append(os, o)
-			seen[key] = true
-			if len(os) >= cfg.Broll.MaxEvents {
-				break
-			}
+		seen[k] = true
+		qs = append(qs, q)
+	}
+	for _, q := range e.Queries {
+		addQ(q)
+	}
+	addQ(e.Query)
+	concept := strings.TrimSpace(e.Concept)
+	label := ""
+	if c, ok := ConceptByName(concept); ok {
+		label = c.Label
+		for _, q := range c.Queries {
+			addQ(q)
 		}
 	}
-	p.Overlays = os
-
-	ss := p.SFX[:0]
-	for _, s := range p.SFX {
-		if len(ss) >= 4 {
+	if len(qs) == 0 {
+		addQ(concept)
+	}
+	if len(qs) == 0 {
+		return VisualEvent{}, false
+	}
+	if concept == "" {
+		concept = qs[0]
+	}
+	start := snap(e.Start, wordStarts, 0.3)
+	if start < 1.2 && dur > 4 {
+		start = 1.2
+	}
+	end := math.Min(e.End, dur)
+	maxLen := maxLenByLayout[layout]
+	if end-start > maxLen {
+		end = start + maxLen
+	}
+	if end-start < MinEventDuration {
+		return VisualEvent{}, false
+	}
+	imp := e.Importance
+	if imp <= 0 || math.IsNaN(imp) {
+		imp = 0.7
+	}
+	imp = clamp(imp+0.05, 0, 1) // director bonus over lexicon heuristics
+	unit := e.UnitID
+	role := ""
+	for _, u := range units {
+		if (unit != "" && u.ID == unit) || (unit == "" && start >= u.Start-0.3 && start <= u.End) {
+			unit, role = u.ID, u.Role
+			if label == "" && len(u.Concepts) > 0 {
+				if c, ok := ConceptByName(u.Concepts[0].Name); ok {
+					label = c.Label
+				}
+			}
 			break
 		}
-		if s.Time < 0 || s.Time > maxT {
-			continue
-		}
-		if s.Name != "pop" && s.Name != "whoosh" {
-			continue
-		}
-		if s.GainDB == 0 {
-			s.GainDB = -22
-		}
-		if s.GainDB < -35 {
-			s.GainDB = -35
-		}
-		if s.GainDB > -14 {
-			s.GainDB = -14
-		}
-		ss = append(ss, s)
 	}
-	p.SFX = ss
+	if label == "" {
+		label = strings.ToUpper(concept)
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "decisão do diretor"
+	}
+	return VisualEvent{
+		Start: round3(start), End: round3(end), Type: typ, Concept: concept, Label: label, Queries: qs,
+		Layout: layout, Importance: round3(imp), Relevance: round3(imp), Role: role, UnitID: unit,
+		Origin: "ollama", Reason: reason,
+	}, true
+}
+
+func snap(t float64, starts []float64, tol float64) float64 {
+	best, bd := t, tol
+	for _, s := range starts {
+		if d := math.Abs(s - t); d < bd {
+			best, bd = s, d
+		}
+	}
+	return best
+}
+
+func unitsForPrompt(units []SemanticUnit) string {
+	var b strings.Builder
+	for _, u := range units {
+		names := make([]string, 0, len(u.Concepts))
+		for _, c := range u.Concepts {
+			names = append(names, c.Name)
+		}
+		fmt.Fprintf(&b, "%s [%.2f-%.2f] %s {%s}: %s\n", u.ID, u.Start, u.End, u.Role, strings.Join(names, ", "), u.Text)
+	}
+	return b.String()
 }
 
 func compactTranscriptJSON(tr transcribe.Transcript) string {
 	type word struct {
+		W string  `json:"w"`
 		T float64 `json:"t"`
 		E float64 `json:"e"`
-		W string  `json:"w"`
 	}
 	words := make([]word, 0, len(tr.Tokens))
 	for _, t := range tr.Tokens {
@@ -272,10 +346,10 @@ func compactTranscriptJSON(tr transcribe.Transcript) string {
 		if w == "" {
 			continue
 		}
-		words = append(words, word{T: t.Start, E: t.End, W: w})
+		words = append(words, word{W: w, T: round3(t.Start), E: round3(t.End)})
 	}
 	b, _ := json.Marshal(words)
 	return string(b)
 }
 
-func DebugJSON(p Plan) string { b, _ := json.MarshalIndent(p, "", "  "); return fmt.Sprintf("%s", b) }
+func DebugJSON(p Plan) string { b, _ := json.MarshalIndent(p, "", "  "); return string(b) }

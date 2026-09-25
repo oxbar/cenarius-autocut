@@ -71,8 +71,9 @@ type CaptionConfig struct {
 
 type ZoomConfig struct {
 	Enabled  bool    `json:"enabled"`
-	Mild     float64 `json:"mild"`
-	Punch    float64 `json:"punch"`
+	Mild     float64 `json:"mild"`     // 1.055-1.07: slow push / reframe
+	Emphasis float64 `json:"emphasis"` // 1.08-1.10: hook / question
+	Punch    float64 `json:"punch"`    // <= 1.12: punchline
 	MinGap   float64 `json:"min_gap"`
 	Duration float64 `json:"duration"`
 }
@@ -82,6 +83,15 @@ type BrollConfig struct {
 	AssetDir  string `json:"asset_dir"`
 	Manifest  string `json:"manifest"`
 	MaxEvents int    `json:"max_events"`
+	// v1.6 smart editor
+	MinVisualGap   float64 `json:"min_visual_gap"`   // A-roll breathing space between inserts (s)
+	Remote         bool    `json:"remote"`           // free remote search (Wikimedia Commons)
+	Procedural     bool    `json:"procedural"`       // FFmpeg motion graphics before self-broll
+	AllowSelfBroll bool    `json:"allow_self_broll"` // last-resort fallback
+	MaxRemoteMB    int     `json:"max_remote_mb"`
+	ReactionSplit  float64 `json:"reaction_split"`   // 0.5 = creator top half, B-roll bottom half
+	ReactionFocusY float64 `json:"reaction_focus_y"` // vertical position of the face in the A-roll (0..1)
+	SeamCaptions   bool    `json:"seam_captions"`    // move captions to the split seam during split layouts
 }
 
 func Default() Config {
@@ -94,8 +104,10 @@ func Default() Config {
 		Output:   OutputConfig{Width: 1080, Height: 1920, FPS: 30, CRF: 18, Preset: "medium", AudioBitrate: "192k"},
 		Cuts:     CutConfig{Enabled: true, NoiseDB: -42, MinSilence: 1.10, KeepSilence: 0.25, MinKeepSegment: 0.20},
 		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 82, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 6, Shadow: 0, MarginV: 560, SafeMargin: 96, MaxWords: 6, MaxCharsPerLine: 24, MaxLines: 2, Uppercase: true, ActiveWord: true},
-		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
-		Broll:    BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 4},
+		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Emphasis: 1.085, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
+		Broll: BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 5,
+			MinVisualGap: 0.35, Remote: true, Procedural: true, AllowSelfBroll: true, MaxRemoteMB: 60,
+			ReactionSplit: 0.5, ReactionFocusY: 0.40, SeamCaptions: true},
 	}
 }
 
@@ -132,6 +144,21 @@ func (c *Config) Normalize(base string) error {
 	}
 	if c.Captions.SafeMargin <= 0 {
 		c.Captions.SafeMargin = 96
+	}
+	if c.Broll.MinVisualGap <= 0 {
+		c.Broll.MinVisualGap = 0.35
+	}
+	if c.Broll.ReactionSplit < 0.35 || c.Broll.ReactionSplit > 0.65 {
+		c.Broll.ReactionSplit = 0.5
+	}
+	if c.Broll.ReactionFocusY <= 0 || c.Broll.ReactionFocusY >= 1 {
+		c.Broll.ReactionFocusY = 0.40
+	}
+	if c.Broll.MaxRemoteMB <= 0 {
+		c.Broll.MaxRemoteMB = 60
+	}
+	if c.Zoom.Emphasis <= 1 {
+		c.Zoom.Emphasis = 1.085
 	}
 	if c.Whisper.Language == "" {
 		c.Whisper.Language = "pt"

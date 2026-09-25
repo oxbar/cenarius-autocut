@@ -16,14 +16,16 @@ import (
 )
 
 type Token struct {
-	Text       string  `json:"text"`
-	Start, End float64 `json:"start","end"`
-	P          float64 `json:"p,omitempty"`
+	Text  string  `json:"text"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+	P     float64 `json:"p,omitempty"`
 }
 type Segment struct {
-	Text       string  `json:"text"`
-	Start, End float64 `json:"start","end"`
-	Tokens     []Token `json:"tokens,omitempty"`
+	Text   string  `json:"text"`
+	Start  float64 `json:"start"`
+	End    float64 `json:"end"`
+	Tokens []Token `json:"tokens,omitempty"`
 }
 type Transcript struct {
 	Language string    `json:"language"`
