@@ -1,6 +1,6 @@
-# CENARIUS AutoCut
+# CENARIUS Studio / AutoCut
 
-Editor local para Shorts/Reels/TikTok feito em Go. A V1 automatiza **cortes de silêncio, transcrição offline, legendas ASS refinadas, zooms editoriais, normalização de áudio, B-roll contextual e render 9:16**. Opcionalmente usa Ollama para melhorar o plano de edição sem API paga.
+Editor local para Shorts/Reels/TikTok feito em Go. O mesmo core agora atende **Edição IA**, **React Mode** e **Longo → Shorts**. O pipeline combina FFmpeg, whisper.cpp, planner semântico, captions ASS, zooms editoriais, B-roll contextual, SFX e render 9:16. Ollama é opcional e funciona como diretor/ranker sem substituir as validações determinísticas do Go.
 
 ## Por que Go
 
@@ -19,8 +19,9 @@ Abra `http://127.0.0.1:8484`, arraste um MP4/MOV e acompanhe o job.
 
 O bootstrap instala via Homebrew:
 - Go
-- FFmpeg
+- FFmpeg compatível (via script de correção)
 - whisper.cpp
+- yt-dlp (para Longo → Shorts via YouTube)
 - modelo Whisper `medium` por padrão
 
 O modelo é baixado de `ggerganov/whisper.cpp` no Hugging Face. Para testar mais rápido, antes do bootstrap:
@@ -36,6 +37,9 @@ WHISPER_MODEL=small ./scripts/bootstrap-macos.sh
 ```bash
 ./bin/cenarius doctor
 ./bin/cenarius edit -i ~/Desktop/video.mov -o ./data/meu-video
+./bin/cenarius react -i ~/Desktop/eu.mov -reaction ~/Desktop/video.mp4 -audio duck -o ./data/react
+./bin/cenarius shorts -i ~/Desktop/podcast.mp4 -count 5
+./bin/cenarius shorts -url "https://www.youtube.com/watch?v=..." -count 5 -generate
 ```
 
 Saídas:
@@ -129,9 +133,108 @@ Tudo fica em `config.json`:
 - O reenquadramento usa `reaction_focus_y` fixo (sem face tracking).
 - A revisão humana continua recomendada antes de publicar.
 
-## Próximas etapas
 
-V2: preview de timeline e aceitar/remover B-roll antes do render; face tracking; captura automatizada de screenshots/interfaces; templates `Commentary`, `Reaction`, `Meme`.
+## Studio Web v2
+
+```bash
+make build
+./bin/cenarius serve
+```
+
+Abra `http://127.0.0.1:8484`. A UI embutida no próprio binário Go tem três modos e não depende de Node/Next.js:
+
+- **Edição IA**: fluxo original de upload → planner → assets → render.
+- **Reagir a vídeo**: dois uploads; o creator fica no painel superior, o vídeo reagido no inferior, captions na seam e fade curto. O layout é uma restrição explícita do produto — o planner não substitui o vídeo escolhido por stock media.
+- **Longo → Shorts**: upload local ou URL do YouTube, análise semântica, score editorial, preview de candidatos e geração em lote.
+
+A interface usa um pequeno subconjunto de ícones Lucide embutidos como SVG para continuar funcionando offline.
+
+## React Mode
+
+O vídeo fornecido pelo usuário vira `SourceManual` (`manual-reaction`) e tem prioridade absoluta. O resolver apenas valida a mídia; não troca por Pexels/Pixabay/Wikimedia. O evento ocupa a timeline do creator com `LayoutReaction`, portanto:
+
+```text
+┌──────────────────────────────┐
+│        CREATOR / A-ROLL      │
+├──────── captions ────────────┤
+│        VÍDEO REAGIDO         │
+└──────────────────────────────┘
+```
+
+`PrepareClip` mantém o reaction em `t=0` (não aplica o offset usado para stock footage), preservando sync. O corte automático de silêncio fica desativado nesse modo pelo mesmo motivo.
+
+Áudio do vídeo reagido:
+
+- `duck` (default): sidechain compressor reduz o vídeo reagido quando sua voz está presente.
+- `muted`: sem áudio do vídeo reagido.
+- `original`: mix audível em volume seguro sob a voz principal.
+
+CLI:
+
+```bash
+./bin/cenarius react \
+  -i ~/Downloads/IMG_6825.MOV \
+  -reaction ~/Downloads/reaction.mp4 \
+  -audio duck \
+  -o ./data/react-demo
+```
+
+## Longo → Shorts
+
+O CENARIUS não corta em blocos cegos de 45 segundos. O fluxo é:
+
+```text
+vídeo/YouTube
+  ↓
+ffprobe + áudio 16 kHz
+  ↓
+Whisper (uma transcrição de análise)
+  ↓
+unidades semânticas reais
+  ↓
+janelas candidatas em boundaries reais
+  ↓
+score heurístico + Ollama opcional
+  ↓
+resolver de overlap
+  ↓
+Top N
+  ↓
+CENARIUS AutoCut em cada corte selecionado
+```
+
+Por padrão:
+
+- mínimo: **30 s**
+- faixa preferida: **40–50 s**
+- máximo: **55 s**
+- `max_overlap`: **0.35** — evita entregar vários cortes quase iguais
+- ranking: `hook`, `engagement`, `value`, `shareability` (0–25 cada; total 0–100)
+
+O score é **auxílio editorial**, não previsão de viralização. O Ollama só recebe IDs/timestamps que já foram gerados a partir do Whisper e pode alterar título/score/razão; timestamps inexistentes são descartados pelo design.
+
+Para YouTube, `yt-dlp` roda localmente com `--no-playlist`. O servidor aceita apenas hosts YouTube/youtu.be.
+
+Configuração:
+
+```json
+"yt_dlp": "yt-dlp",
+"shorts": {
+  "enabled": true,
+  "min_duration": 30,
+  "ideal_min": 40,
+  "ideal_max": 50,
+  "max_duration": 55,
+  "default_count": 5,
+  "max_count": 10,
+  "max_overlap": 0.35,
+  "use_ollama_rank": true
+}
+```
+
+### Nota sobre a referência SupoClip
+
+O ZIP do SupoClip foi usado como **referência de produto/arquitetura** para conceitos como seleção semântica, faixa de duração, score editorial, upload/YouTube e cards de resultado. Nenhum código-fonte do SupoClip foi incorporado; a implementação acima foi escrita em Go dentro da arquitetura existente do CENARIUS.
 
 ## Segurança
 

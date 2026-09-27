@@ -23,6 +23,7 @@ const (
 	SourceCache     = planner.SourceCache
 	SourcePexels    = planner.SourcePexels
 	SourcePixabay   = planner.SourcePixabay
+	SourceManual    = planner.SourceManual
 	SourceCommons   = planner.SourceCommons
 	SourceProcedure = planner.SourceProcedure
 	SourceSelfBroll = planner.SourceSelfBroll
@@ -177,6 +178,24 @@ func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Pla
 	usedConcepts := map[string]int{}
 	for _, e := range p.VisualEvents {
 		started := time.Now()
+		if e.Asset != nil && e.Asset.Source == planner.SourceManual && strings.TrimSpace(e.Asset.Path) != "" {
+			m, err := r.Validator.Validate(ctx, e.Asset.Path, firstNonEmpty(e.Asset.Type, "video"))
+			if err != nil {
+				logger.Warn("visual.asset.manual_invalid", "event", e.ID, "path", e.Asset.Path, "error", err)
+				counts["dropped"]++
+				continue
+			}
+			if e.Asset.Duration <= 0 {
+				e.Asset.Duration = m.Duration
+			}
+			counts[planner.SourceManual]++
+			markUsedRef(used, e.Asset)
+			usedConcepts[normalize(e.Concept)]++
+			attributions = append(attributions, Asset{EventID: e.ID, Keyword: e.Concept, Path: e.Asset.Path, Source: planner.SourceManual, MediaType: e.Asset.Type, License: "user-provided", Attribution: "Arquivo fornecido pelo usuário", Duration: e.Asset.Duration, Width: m.Width, Height: m.Height})
+			logger.Info("visual.asset.event_done", "event", e.ID, "source", planner.SourceManual, "type", e.Asset.Type, "duration_ms", time.Since(started).Milliseconds())
+			out.VisualEvents = append(out.VisualEvents, e)
+			continue
+		}
 		ref, a, err := r.resolveEvent(ctx, e, used)
 		if err != nil {
 			logger.Warn("visual.asset.fallback", "event", e.ID, "concept", e.Concept, "fallback", "drop", "error", err)
@@ -196,7 +215,7 @@ func (r *Resolver) ResolvePlan(ctx context.Context, p planner.Plan) (planner.Pla
 	}
 	total := len(p.VisualEvents)
 	logger.Info("visual.asset.summary", "events", total, "local", counts[SourceLocal], "cache", counts[SourceCache],
-		"pexels", counts[SourcePexels], "pixabay", counts[SourcePixabay], "commons", counts[SourceCommons],
+		"pexels", counts[SourcePexels], "pixabay", counts[SourcePixabay], "manual", counts[SourceManual], "commons", counts[SourceCommons],
 		"procedural", counts[SourceProcedure], "self_broll", counts[SourceSelfBroll], "dropped", counts["dropped"], "unique_concepts", len(usedConcepts))
 	if total > 0 && counts[SourceSelfBroll]*2 >= total && counts[SourceSelfBroll] > 0 {
 		logger.Warn("visual.asset.self_broll_majority", "self_broll", counts[SourceSelfBroll], "events", total,

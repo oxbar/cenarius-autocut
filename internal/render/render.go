@@ -63,10 +63,10 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 	args := []string{"-y", "-i", input}
 	next := 1
 	type item struct {
-		e                  planner.VisualEvent
-		clip, mask, shadow int
-		self               bool
-		labelFile          string
+		e                         planner.VisualEvent
+		clip, mask, shadow, audio int
+		self                      bool
+		labelFile                 string
 	}
 	var items []item
 	for _, e := range events {
@@ -75,7 +75,7 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 			logger.Warn("visual.render.event", "event", e.ID, "skipped", true, "reason", "sem asset ou duração curta")
 			continue
 		}
-		it := item{e: e, mask: -1, shadow: -1}
+		it := item{e: e, mask: -1, shadow: -1, audio: -1}
 		if e.Asset.Source == planner.SourceSelfBroll || e.Asset.Path == "" {
 			it.self = true
 		} else {
@@ -103,6 +103,16 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 				args = append(args, "-i", clip)
 				it.clip = next
 				next++
+				if e.Asset.Source == planner.SourceManual && e.Asset.AudioMode != "" && e.Asset.AudioMode != "muted" {
+					audioPath := filepath.Join(parts, fmt.Sprintf("%s-reaction-audio.m4a", e.ID))
+					if err := PrepareReactionAudio(ctx, cfg, *e.Asset, dur, audioPath); err != nil {
+						logger.Warn("reaction.audio.prepare_failed", "event", e.ID, "error", err)
+					} else {
+						args = append(args, "-i", audioPath)
+						it.audio = next
+						next++
+					}
+				}
 				if e.Layout == planner.LayoutCard || e.Layout == planner.LayoutPIP {
 					r := g.Card
 					if e.Layout == planner.LayoutPIP {
@@ -225,8 +235,44 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 	}
 
 	audioMap := "0:a?"
-	if hasAudio && len(plan.SFX) > 0 {
-		labels := []string{"[0:a]"}
+	if hasAudio {
+		duckItems := make([]item, 0)
+		for _, it := range items {
+			if it.audio >= 0 && it.e.Asset != nil && it.e.Asset.AudioMode == "duck" {
+				duckItems = append(duckItems, it)
+			}
+		}
+		voiceLabel := "[0:a]"
+		duckKeys := make([]string, len(duckItems))
+		if len(duckItems) > 0 {
+			fmt.Fprintf(&fc, ";[0:a]asplit=%d[voicebase]", len(duckItems)+1)
+			for i := range duckItems {
+				duckKeys[i] = fmt.Sprintf("[voicekey%d]", i)
+				fc.WriteString(duckKeys[i])
+			}
+			voiceLabel = "[voicebase]"
+		}
+
+		labels := []string{voiceLabel}
+		duckIndex := 0
+		for _, it := range items {
+			if it.audio < 0 || it.e.Asset == nil || it.e.Asset.AudioMode == "muted" {
+				continue
+			}
+			delay := int(math.Round(it.e.Start * 1000))
+			base := fmt.Sprintf("[reaction%d]", it.audio)
+			switch it.e.Asset.AudioMode {
+			case "duck":
+				raw := fmt.Sprintf("[reactionraw%d]", it.audio)
+				fmt.Fprintf(&fc, ";[%d:a]volume=-5dB,adelay=%d|%d%s;%s%ssidechaincompress=threshold=0.025:ratio=12:attack=15:release=280:makeup=1%s", it.audio, delay, delay, raw, raw, duckKeys[duckIndex], base)
+				duckIndex++
+			default: // original: audible mix while preserving creator intelligibility
+				fmt.Fprintf(&fc, ";[%d:a]volume=-8dB,adelay=%d|%d%s", it.audio, delay, delay, base)
+			}
+			labels = append(labels, base)
+			logger.Info("reaction.audio.event", "event", it.e.ID, "mode", it.e.Asset.AudioMode, "start", it.e.Start)
+		}
+
 		for i, sfx := range plan.SFX {
 			label := fmt.Sprintf("[sfx%d]", i)
 			delay := int(math.Round(sfx.Time * 1000))
@@ -235,8 +281,10 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 			labels = append(labels, label)
 			logger.Info("audio.sfx.event", "name", sfx.Name, "time", sfx.Time, "gain_db", gain, "reason", sfx.Reason)
 		}
-		fmt.Fprintf(&fc, ";%samix=inputs=%d:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]", strings.Join(labels, ""), len(labels))
-		audioMap = "[aout]"
+		if len(labels) > 1 {
+			fmt.Fprintf(&fc, ";%samix=inputs=%d:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]", strings.Join(labels, ""), len(labels))
+			audioMap = "[aout]"
+		}
 	}
 
 	script := output + ".filter"
@@ -244,7 +292,7 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 		return err
 	}
 	args = append(args, "-filter_complex", fc.String(), "-map", "[vout]", "-map", audioMap)
-	if !(hasAudio && len(plan.SFX) > 0) {
+	if hasAudio && audioMap == "0:a?" {
 		args = append(args, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11")
 	}
 	args = append(args, "-r", strconv.Itoa(fps), "-c:v", "libx264", "-profile:v", "high", "-preset", cfg.Output.Preset, "-crf", strconv.Itoa(cfg.Output.CRF), "-pix_fmt", "yuv420p",

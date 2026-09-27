@@ -8,7 +8,7 @@ fi
 # We intentionally do not require Homebrew core ffmpeg here: on current macOS
 # bottles it may be built without libass. The fix script chooses a compatible
 # ffmpeg and writes its absolute path into config.json.
-brew install go whisper.cpp
+brew install go whisper.cpp yt-dlp
 
 mkdir -p models
 MODEL=${WHISPER_MODEL:-large-v3-turbo}

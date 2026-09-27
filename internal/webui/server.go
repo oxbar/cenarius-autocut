@@ -17,17 +17,37 @@ import (
 
 	"cenarius-autocut/internal/app"
 	"cenarius-autocut/internal/config"
+	"cenarius-autocut/internal/shorts"
 )
 
 //go:embed static/*
 var staticFS embed.FS
 
-type Job struct {
-	ID, Status, Stage, Detail, Output string
-	Percent                           int
-	Error                             string
-	Result                            *app.Result
+type ClipOutput struct {
+	ID        string           `json:"id"`
+	Title     string           `json:"title"`
+	Output    string           `json:"-"`
+	Candidate shorts.Candidate `json:"candidate"`
+	Download  string           `json:"download"`
 }
+
+type Job struct {
+	ID         string             `json:"id"`
+	Mode       string             `json:"mode"`
+	Status     string             `json:"status"`
+	Stage      string             `json:"stage"`
+	Detail     string             `json:"detail"`
+	Percent    int                `json:"percent"`
+	Error      string             `json:"error,omitempty"`
+	Output     string             `json:"-"`
+	Download   string             `json:"download,omitempty"`
+	Result     *app.Result        `json:"result,omitempty"`
+	Candidates []shorts.Candidate `json:"candidates,omitempty"`
+	Clips      []ClipOutput       `json:"clips,omitempty"`
+	Source     string             `json:"-"`
+	Dir        string             `json:"-"`
+}
+
 type Server struct {
 	cfg  config.Config
 	mu   sync.RWMutex
@@ -35,13 +55,19 @@ type Server struct {
 }
 
 func New(cfg config.Config) *Server { return &Server{cfg: cfg, jobs: map[string]*Job{}} }
+
 func (s *Server) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("/", s.index)
+	m.Handle("/static/", http.FileServer(http.FS(staticFS)))
 	m.HandleFunc("/api/jobs", s.jobsHandler)
 	m.HandleFunc("/api/jobs/", s.jobHandler)
+	m.HandleFunc("/api/reactions", s.reactionHandler)
+	m.HandleFunc("/api/shorts/analyze", s.shortsAnalyzeHandler)
+	m.HandleFunc("/api/shorts/", s.shortsHandler)
 	return m
 }
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -49,77 +75,318 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 	b, _ := staticFS.ReadFile("static/index.html")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(b)
+	_, _ = w.Write(b)
 }
+
 func (s *Server) jobsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method", 405)
+		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 2<<30)
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		http.Error(w, err.Error(), 400)
+	if err := parseMultipart(w, r); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	f, h, err := r.FormFile("video")
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		http.Error(w, "selecione um vídeo", http.StatusBadRequest)
 		return
 	}
 	defer f.Close()
+	id, dir, input, err := s.storeUpload(h, f, "input")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	j := &Job{ID: id, Mode: app.ModeAuto, Status: "queued", Stage: "queued", Dir: dir, Source: input}
+	s.put(j)
+	go s.runAuto(id, input, dir)
+	writeJSON(w, http.StatusAccepted, s.snapshot(id))
+}
+
+func (s *Server) reactionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := parseMultipart(w, r); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	creator, ch, err := r.FormFile("creator")
+	if err != nil {
+		http.Error(w, "selecione seu vídeo", http.StatusBadRequest)
+		return
+	}
+	defer creator.Close()
+	reaction, rh, err := r.FormFile("reaction")
+	if err != nil {
+		http.Error(w, "selecione o vídeo para reagir", http.StatusBadRequest)
+		return
+	}
+	defer reaction.Close()
 	id := newID()
 	dir := filepath.Join(s.cfg.WorkDir, "jobs", id)
-	os.MkdirAll(dir, 0755)
-	name := safeName(h)
-	input := filepath.Join(dir, name)
-	if err := save(input, f); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	j := &Job{ID: id, Status: "queued", Stage: "queued"}
-	s.mu.Lock()
-	s.jobs[id] = j
-	s.mu.Unlock()
-	go s.run(id, input, dir)
-	writeJSON(w, 202, j)
-}
-func (s *Server) run(id, input, dir string) {
-	ctx := context.Background()
-	s.set(id, func(j *Job) { j.Status = "running" })
-	res, err := app.Run(ctx, s.cfg, input, dir, func(stage string, p int, d string) {
-		s.set(id, func(j *Job) { j.Stage = stage; j.Percent = p; j.Detail = d })
-	})
-	if err != nil {
-		s.set(id, func(j *Job) { j.Status = "error"; j.Error = err.Error() })
+	creatorPath := filepath.Join(dir, "creator"+safeExt(ch))
+	reactionPath := filepath.Join(dir, "reaction"+safeExt(rh))
+	if err := save(creatorPath, creator); err != nil {
+		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.set(id, func(j *Job) { j.Status = "done"; j.Percent = 100; j.Result = &res; j.Output = res.Output })
+	if err := save(reactionPath, reaction); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	audioMode := normalizeAudioMode(r.FormValue("audio_mode"))
+	j := &Job{ID: id, Mode: app.ModeReaction, Status: "queued", Stage: "queued", Dir: dir, Source: creatorPath}
+	s.put(j)
+	go s.runReaction(id, creatorPath, reactionPath, audioMode, dir)
+	writeJSON(w, http.StatusAccepted, s.snapshot(id))
 }
+
+func (s *Server) shortsAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := parseMultipart(w, r); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	id := newID()
+	dir := filepath.Join(s.cfg.WorkDir, "jobs", id)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	url := strings.TrimSpace(r.FormValue("youtube_url"))
+	count := shorts.ParseCount(r.FormValue("count"), s.cfg.Shorts.DefaultCount, s.cfg.Shorts.MaxCount)
+	var source string
+	if f, h, err := r.FormFile("video"); err == nil {
+		defer f.Close()
+		source = filepath.Join(dir, "long-source"+safeExt(h))
+		if err := save(source, f); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	} else if url == "" {
+		http.Error(w, "envie um vídeo ou uma URL do YouTube", http.StatusBadRequest)
+		return
+	}
+	j := &Job{ID: id, Mode: "shorts", Status: "queued", Stage: "queued", Dir: dir, Source: source}
+	s.put(j)
+	go s.runShortsAnalyze(id, source, url, dir, count)
+	writeJSON(w, http.StatusAccepted, s.snapshot(id))
+}
+
+func (s *Server) shortsHandler(w http.ResponseWriter, r *http.Request) {
+	x := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/shorts/"), "/")
+	parts := strings.Split(x, "/")
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+	id, action := parts[0], parts[1]
+	j := s.snapshot(id)
+	if j == nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch action {
+	case "generate":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", 405)
+			return
+		}
+		var req struct {
+			IDs []string `json:"ids"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "JSON inválido", 400)
+			return
+		}
+		selected := make([]shorts.Candidate, 0, len(req.IDs))
+		for _, id := range req.IDs {
+			if c, ok := shorts.CandidateByID(j.Candidates, id); ok {
+				selected = append(selected, c)
+			}
+		}
+		if len(selected) == 0 {
+			http.Error(w, "selecione pelo menos um corte", 400)
+			return
+		}
+		s.set(id, func(x *Job) {
+			x.Status = "running"
+			x.Stage = "shorts.generate"
+			x.Percent = 0
+			x.Clips = nil
+			x.Error = ""
+		})
+		go s.runShortsGenerate(id, j.Source, j.Dir, selected)
+		writeJSON(w, 202, s.snapshot(id))
+	case "preview":
+		if r.Method != http.MethodGet || len(parts) != 3 {
+			http.NotFound(w, r)
+			return
+		}
+		c, ok := shorts.CandidateByID(j.Candidates, parts[2])
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		previewDir := filepath.Join(j.Dir, "previews")
+		_ = os.MkdirAll(previewDir, 0755)
+		path := filepath.Join(previewDir, c.ID+".mp4")
+		if _, err := os.Stat(path); err != nil {
+			if err := shorts.ExtractRange(r.Context(), s.cfg, j.Source, c.Start, c.End, path); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+		}
+		http.ServeFile(w, r, path)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) runAuto(id, input, dir string) {
+	s.set(id, func(j *Job) { j.Status = "running" })
+	res, err := app.Run(context.Background(), s.cfg, input, dir, s.progress(id))
+	if err != nil {
+		s.fail(id, err)
+		return
+	}
+	s.set(id, func(j *Job) {
+		j.Status = "done"
+		j.Percent = 100
+		j.Result = &res
+		j.Output = res.Output
+		j.Download = "/api/jobs/" + id + "/download"
+	})
+}
+
+func (s *Server) runReaction(id, creator, reaction, audioMode, dir string) {
+	s.set(id, func(j *Job) { j.Status = "running" })
+	res, err := app.RunWithOptions(context.Background(), s.cfg, creator, dir, s.progress(id), app.RunOptions{Mode: app.ModeReaction, Reaction: &app.ReactionOptions{Path: reaction, AudioMode: audioMode}})
+	if err != nil {
+		s.fail(id, err)
+		return
+	}
+	s.set(id, func(j *Job) {
+		j.Status = "done"
+		j.Percent = 100
+		j.Result = &res
+		j.Output = res.Output
+		j.Download = "/api/jobs/" + id + "/download"
+	})
+}
+
+func (s *Server) runShortsAnalyze(id, source, url, dir string, count int) {
+	s.set(id, func(j *Job) { j.Status = "running" })
+	ctx := context.Background()
+	if source == "" {
+		var err error
+		source, err = shorts.DownloadYouTube(ctx, s.cfg, url, filepath.Join(dir, "youtube"), func(stage string, p int, detail string) {
+			s.set(id, func(j *Job) { j.Stage = stage; j.Percent = min(15, p); j.Detail = detail })
+		})
+		if err != nil {
+			s.fail(id, err)
+			return
+		}
+		s.set(id, func(j *Job) { j.Source = source })
+	}
+	analysis, err := shorts.Analyze(ctx, s.cfg, source, filepath.Join(dir, "analysis"), count, func(stage string, p int, detail string) {
+		s.set(id, func(j *Job) { j.Stage = "shorts." + stage; j.Percent = 15 + int(float64(p)*.85); j.Detail = detail })
+	})
+	if err != nil {
+		s.fail(id, err)
+		return
+	}
+	s.set(id, func(j *Job) {
+		j.Status = "analyzed"
+		j.Stage = "shorts.ready"
+		j.Percent = 100
+		j.Detail = fmt.Sprintf("%d cortes encontrados", len(analysis.Candidates))
+		j.Candidates = analysis.Candidates
+		j.Source = source
+	})
+}
+
+func (s *Server) runShortsGenerate(id, source, dir string, selected []shorts.Candidate) {
+	ctx := context.Background()
+	outputs := make([]ClipOutput, 0, len(selected))
+	for i, c := range selected {
+		clipDir := filepath.Join(dir, "generated", c.ID)
+		generated, err := shorts.Generate(ctx, s.cfg, source, c, clipDir, func(stage string, p int, detail string) {
+			base := float64(i) / float64(len(selected))
+			within := float64(p) / 100 / float64(len(selected))
+			total := int((base + within) * 100)
+			s.set(id, func(j *Job) {
+				j.Stage = "shorts." + stage
+				j.Percent = total
+				j.Detail = fmt.Sprintf("%s · %d/%d · %s", c.Title, i+1, len(selected), detail)
+			})
+		})
+		if err != nil {
+			s.fail(id, fmt.Errorf("%s: %w", c.ID, err))
+			return
+		}
+		outputs = append(outputs, ClipOutput{ID: c.ID, Title: c.Title, Output: generated.Result.Output, Candidate: c, Download: "/api/jobs/" + id + "/clips/" + c.ID})
+	}
+	s.set(id, func(j *Job) {
+		j.Status = "done"
+		j.Stage = "shorts.done"
+		j.Percent = 100
+		j.Detail = fmt.Sprintf("%d Shorts gerados", len(outputs))
+		j.Clips = outputs
+	})
+}
+
 func (s *Server) jobHandler(w http.ResponseWriter, r *http.Request) {
-	x := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	x := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/jobs/"), "/")
 	parts := strings.Split(x, "/")
 	id := parts[0]
-	s.mu.RLock()
-	j, ok := s.jobs[id]
-	if ok {
-		cp := *j
-		j = &cp
-	}
-	s.mu.RUnlock()
-	if !ok {
+	j := s.snapshot(id)
+	if j == nil {
 		http.NotFound(w, r)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "download" {
-		if j.Status != "done" {
-			http.Error(w, "not ready", 409)
+		if j.Status != "done" || j.Output == "" {
+			http.Error(w, "not ready", http.StatusConflict)
 			return
 		}
 		w.Header().Set("Content-Disposition", "attachment; filename=cenarius-final.mp4")
 		http.ServeFile(w, r, j.Output)
 		return
 	}
-	writeJSON(w, 200, j)
+	if len(parts) == 3 && parts[1] == "clips" {
+		for _, clip := range j.Clips {
+			if clip.ID == parts[2] {
+				w.Header().Set("Content-Disposition", "attachment; filename=cenarius-"+clip.ID+".mp4")
+				http.ServeFile(w, r, clip.Output)
+				return
+			}
+		}
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, http.StatusOK, j)
+}
+
+func (s *Server) progress(id string) app.Progress {
+	return func(stage string, p int, d string) {
+		s.set(id, func(j *Job) { j.Stage = stage; j.Percent = p; j.Detail = d })
+	}
+}
+
+func (s *Server) put(j *Job) { s.mu.Lock(); s.jobs[j.ID] = j; s.mu.Unlock() }
+func (s *Server) fail(id string, err error) {
+	s.set(id, func(j *Job) { j.Status = "error"; j.Error = err.Error() })
 }
 func (s *Server) set(id string, fn func(*Job)) {
 	s.mu.Lock()
@@ -128,15 +395,43 @@ func (s *Server) set(id string, fn func(*Job)) {
 		fn(j)
 	}
 }
-func newID() string { b := make([]byte, 8); rand.Read(b); return hex.EncodeToString(b) }
-func safeName(h *multipart.FileHeader) string {
+func (s *Server) snapshot(id string) *Job {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	j := s.jobs[id]
+	if j == nil {
+		return nil
+	}
+	cp := *j
+	cp.Candidates = append([]shorts.Candidate(nil), j.Candidates...)
+	cp.Clips = append([]ClipOutput(nil), j.Clips...)
+	return &cp
+}
+
+func (s *Server) storeUpload(h *multipart.FileHeader, f multipart.File, prefix string) (id, dir, path string, err error) {
+	id = newID()
+	dir = filepath.Join(s.cfg.WorkDir, "jobs", id)
+	if err = os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	path = filepath.Join(dir, prefix+safeExt(h))
+	err = save(path, f)
+	return
+}
+
+func parseMultipart(w http.ResponseWriter, r *http.Request) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<30)
+	return r.ParseMultipartForm(64 << 20)
+}
+
+func newID() string { b := make([]byte, 8); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+func safeExt(h *multipart.FileHeader) string {
 	ext := strings.ToLower(filepath.Ext(h.Filename))
 	switch ext {
-	case ".mp4", ".mov", ".m4v", ".webm":
-	default:
-		ext = ".mp4"
+	case ".mp4", ".mov", ".m4v", ".webm", ".mkv":
+		return ext
 	}
-	return "input" + ext
+	return ".mp4"
 }
 func save(path string, r io.Reader) error {
 	f, err := os.Create(path)
@@ -147,12 +442,22 @@ func save(path string, r io.Reader) error {
 	_, err = io.Copy(f, r)
 	return err
 }
+func normalizeAudioMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "muted":
+		return "muted"
+	case "original":
+		return "original"
+	default:
+		return "duck"
+	}
+}
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 func Listen(addr string, cfg config.Config) error {
-	fmt.Printf("CENARIUS AutoCut: http://%s\n", addr)
+	fmt.Printf("CENARIUS Studio: http://%s\n", addr)
 	return http.ListenAndServe(addr, New(cfg).Handler())
 }

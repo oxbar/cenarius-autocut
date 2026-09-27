@@ -228,3 +228,46 @@ func TestFinalWithoutDrawtext(t *testing.T) {
 		t.Fatal("drawtext used although unavailable")
 	}
 }
+
+func TestManualReactionAudioDuckRenders(t *testing.T) {
+	cfg := need(t)
+	if testing.Short() {
+		t.Skip("integração FFmpeg")
+	}
+	cfg.Output.Width, cfg.Output.Height = 360, 640
+	cfg.Output.FPS = 30
+	cfg.Captions.Enabled = false
+	cfg.Zoom.Enabled = false
+	d := t.TempDir()
+	creator := filepath.Join(d, "creator.mp4")
+	reaction := filepath.Join(d, "reaction.mp4")
+	run(t, "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=360x640:rate=30:duration=3",
+		"-f", "lavfi", "-i", "sine=frequency=300:sample_rate=48000:duration=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", creator)
+	run(t, "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=3",
+		"-f", "lavfi", "-i", "sine=frequency=700:sample_rate=48000:duration=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", reaction)
+	plan := planner.Plan{VisualEvents: []planner.VisualEvent{{ID: "reaction-001", Start: 0, End: 3, Layout: planner.LayoutReaction, Concept: "manual reaction", Asset: &planner.AssetRef{Path: reaction, Type: "video", Source: planner.SourceManual, Duration: 3, AudioMode: "duck"}}}}
+	out := filepath.Join(d, "out.mp4")
+	if err := Final(context.Background(), cfg, creator, "", out, plan, true); err != nil {
+		t.Fatal(err)
+	}
+	var pj probe
+	b, err := exec.Command(fpBin, "-v", "error", "-show_streams", "-show_format", "-of", "json", out).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &pj); err != nil {
+		t.Fatal(err)
+	}
+	hasA, hasV := false, false
+	for _, s := range pj.Streams {
+		if s.CodecType == "audio" {
+			hasA = true
+		}
+		if s.CodecType == "video" {
+			hasV = true
+		}
+	}
+	if !hasA || !hasV {
+		t.Fatalf("reaction output streams missing: audio=%v video=%v", hasA, hasV)
+	}
+}

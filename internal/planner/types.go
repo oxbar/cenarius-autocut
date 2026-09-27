@@ -62,6 +62,7 @@ const (
 	SourceCache     = "cache"
 	SourcePexels    = "pexels"
 	SourcePixabay   = "pixabay"
+	SourceManual    = "manual-reaction"
 	SourceCommons   = "wikimedia-commons"
 	SourceProcedure = "procedural"
 	SourceSelfBroll = "self-broll"
@@ -69,16 +70,17 @@ const (
 
 // AssetRef is what the resolver attached to a visual event.
 type AssetRef struct {
-	Path     string  `json:"path,omitempty"`
-	Type     string  `json:"type,omitempty"` // video | image
-	Source   string  `json:"source"`
-	Origin   string  `json:"origin,omitempty"` // original source when served from cache
-	Query    string  `json:"query,omitempty"`  // query that matched
-	URL      string  `json:"url,omitempty"`
-	License  string  `json:"license,omitempty"`
-	Author   string  `json:"author,omitempty"`
-	Duration float64 `json:"duration,omitempty"`
-	Fallback bool    `json:"fallback,omitempty"`
+	Path      string  `json:"path,omitempty"`
+	Type      string  `json:"type,omitempty"` // video | image
+	Source    string  `json:"source"`
+	Origin    string  `json:"origin,omitempty"` // original source when served from cache
+	Query     string  `json:"query,omitempty"`  // query that matched
+	URL       string  `json:"url,omitempty"`
+	License   string  `json:"license,omitempty"`
+	Author    string  `json:"author,omitempty"`
+	Duration  float64 `json:"duration,omitempty"`
+	Fallback  bool    `json:"fallback,omitempty"`
+	AudioMode string  `json:"audio_mode,omitempty"` // muted | duck | original (manual reaction assets)
 }
 
 // VisualEvent is an editorial decision: "between start and end, show this

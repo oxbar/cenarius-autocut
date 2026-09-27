@@ -620,3 +620,31 @@ func TestWriteAttributionsPreservesProviderMetadata(t *testing.T) {
 		t.Fatalf("attribution metadata lost: %+v", got)
 	}
 }
+
+type staticValidator struct {
+	media Media
+	err   error
+}
+
+func (v staticValidator) Validate(context.Context, string, string) (Media, error) {
+	return v.media, v.err
+}
+
+func TestResolvePlanPreservesManualReactionAsset(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "reaction.mp4")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{1}, 1024), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := New(d, filepath.Join(d, "none.json"), filepath.Join(d, "cache"))
+	r.Remote, r.Procedural, r.AllowSelfBroll = false, false, false
+	r.Validator = staticValidator{media: Media{Type: "video", Width: 1920, Height: 1080, Duration: 42}}
+	p := planner.Plan{VisualEvents: []planner.VisualEvent{{ID: "reaction-001", Start: 0, End: 20, Concept: "manual reaction", Layout: planner.LayoutReaction, Asset: &planner.AssetRef{Path: path, Type: "video", Source: planner.SourceManual, AudioMode: "duck"}}}}
+	out, attrs := r.ResolvePlan(context.Background(), p)
+	if len(out.VisualEvents) != 1 || out.VisualEvents[0].Asset.Source != planner.SourceManual || out.VisualEvents[0].Asset.AudioMode != "duck" {
+		t.Fatalf("manual asset was not preserved: %+v", out.VisualEvents)
+	}
+	if len(attrs) != 1 || attrs[0].Source != planner.SourceManual || attrs[0].License != "user-provided" {
+		t.Fatalf("manual attribution missing: %+v", attrs)
+	}
+}

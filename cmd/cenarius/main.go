@@ -11,6 +11,7 @@ import (
 	"cenarius-autocut/internal/app"
 	"cenarius-autocut/internal/config"
 	"cenarius-autocut/internal/execx"
+	"cenarius-autocut/internal/shorts"
 	"cenarius-autocut/internal/webui"
 )
 
@@ -24,6 +25,10 @@ func main() {
 		serve(os.Args[2:])
 	case "edit":
 		edit(os.Args[2:])
+	case "react":
+		react(os.Args[2:])
+	case "shorts":
+		shortsCmd(os.Args[2:])
 	case "doctor":
 		doctor(os.Args[2:])
 	default:
@@ -74,6 +79,86 @@ func edit(args []string) {
 	fmt.Printf("duração: %.1fs -> %.1fs\n", res.OriginalDuration, res.FinalDuration)
 	fmt.Printf("debug: %s\n", res.DebugLog)
 }
+
+func react(args []string) {
+	fs := flag.NewFlagSet("react", flag.ExitOnError)
+	c := fs.String("config", "config.json", "config")
+	in := fs.String("i", "", "seu vídeo / A-roll")
+	reaction := fs.String("reaction", "", "vídeo para reagir")
+	audio := fs.String("audio", "duck", "áudio do reagido: duck|muted|original")
+	out := fs.String("o", "", "diretório de saída")
+	fs.Parse(args)
+	if *in == "" || *reaction == "" {
+		fatal(fmt.Errorf("use react -i creator.mov -reaction video.mp4"))
+	}
+	cfg := load(*c)
+	if *out == "" {
+		*out = filepath.Join(cfg.WorkDir, "reaction-cli")
+	}
+	res, err := app.RunWithOptions(context.Background(), cfg, *in, *out, func(s string, p int, d string) {
+		fmt.Printf("[%3d%%] %-16s %s\n", p, s, d)
+	}, app.RunOptions{Mode: app.ModeReaction, Reaction: &app.ReactionOptions{Path: *reaction, AudioMode: *audio}})
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("\nOK: %s\n", res.Output)
+}
+
+func shortsCmd(args []string) {
+	fs := flag.NewFlagSet("shorts", flag.ExitOnError)
+	c := fs.String("config", "config.json", "config")
+	in := fs.String("i", "", "vídeo longo local")
+	url := fs.String("url", "", "URL do YouTube")
+	out := fs.String("o", "", "diretório de saída")
+	count := fs.Int("count", 5, "quantidade de cortes")
+	generate := fs.Bool("generate", false, "gerar/editar todos os cortes selecionados")
+	fs.Parse(args)
+	if *in == "" && *url == "" {
+		fatal(fmt.Errorf("use shorts -i video.mp4 ou shorts -url https://youtube.com/..."))
+	}
+	cfg := load(*c)
+	if *out == "" {
+		*out = filepath.Join(cfg.WorkDir, "shorts-cli")
+	}
+	if err := os.MkdirAll(*out, 0755); err != nil {
+		fatal(err)
+	}
+	source := *in
+	if source == "" {
+		var err error
+		source, err = shorts.DownloadYouTube(context.Background(), cfg, *url, filepath.Join(*out, "youtube"), func(stage string, p int, d string) {
+			fmt.Printf("[%3d%%] %-16s %s\n", p, stage, d)
+		})
+		if err != nil {
+			fatal(err)
+		}
+	}
+	analysis, err := shorts.Analyze(context.Background(), cfg, source, filepath.Join(*out, "analysis"), *count, func(stage string, p int, d string) {
+		fmt.Printf("[%3d%%] %-16s %s\n", p, stage, d)
+	})
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("\n%d cortes encontrados:\n", len(analysis.Candidates))
+	for _, x := range analysis.Candidates {
+		fmt.Printf("- %s %.1fs-%.1fs (%0.1fs) score=%d/100 — %s\n", x.ID, x.Start, x.End, x.Duration, x.Scores.Total, x.Title)
+	}
+	fmt.Printf("highlights: %s\n", analysis.HighlightsJSON)
+	if !*generate {
+		return
+	}
+	for i, x := range analysis.Candidates {
+		dir := filepath.Join(*out, "generated", x.ID)
+		gen, err := shorts.Generate(context.Background(), cfg, source, x, dir, func(stage string, p int, d string) {
+			fmt.Printf("[%d/%d %3d%%] %-16s %s\n", i+1, len(analysis.Candidates), p, stage, d)
+		})
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Printf("  -> %s\n", gen.Result.Output)
+	}
+}
+
 func hasFFmpegFilter(output, name string) bool {
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
@@ -98,6 +183,11 @@ func doctor(args []string) {
 		} else {
 			fmt.Printf("✓ %s\n", x.name)
 		}
+	}
+	if err := execx.LookPath(cfg.YTDLP); err != nil {
+		fmt.Printf("! yt-dlp: %v (necessário apenas para Longo → Shorts via YouTube)\n", err)
+	} else {
+		fmt.Println("✓ yt-dlp (YouTube)")
 	}
 	if r, err := execx.Run(context.Background(), nil, cfg.FFmpeg, "-hide_banner", "-filters"); err != nil {
 		fmt.Println("✗ não foi possível listar filtros do FFmpeg")
@@ -129,7 +219,7 @@ func doctor(args []string) {
 	}
 }
 func usage() {
-	fmt.Println("CENARIUS AutoCut\n\n  cenarius doctor [-config config.json]\n  cenarius edit -i video.mp4 [-o data/cli]\n  cenarius serve [-addr 127.0.0.1:8484]")
+	fmt.Println("CENARIUS Studio\n\n  cenarius doctor [-config config.json]\n  cenarius edit -i video.mp4 [-o data/cli]\n  cenarius react -i creator.mov -reaction video.mp4 [-audio duck]\n  cenarius shorts -i longo.mp4 [-count 5] [-generate]\n  cenarius shorts -url https://youtube.com/... [-count 5] [-generate]\n  cenarius serve [-addr 127.0.0.1:8484]")
 }
 func fatal(err error) {
 	if err != nil {

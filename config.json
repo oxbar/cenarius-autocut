@@ -2,6 +2,7 @@
   "work_dir": "./data",
   "ffmpeg": "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
   "ffprobe": "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe",
+  "yt_dlp": "yt-dlp",
   "whisper": {
     "binary": "whisper-cli",
     "model": "./models/ggml-large-v3-turbo.bin",
@@ -70,5 +71,16 @@
     "reaction_split": 0.5,
     "reaction_focus_y": 0.4,
     "seam_captions": true
+  },
+  "shorts": {
+    "enabled": true,
+    "min_duration": 30,
+    "ideal_min": 40,
+    "ideal_max": 50,
+    "max_duration": 55,
+    "default_count": 5,
+    "max_count": 10,
+    "max_overlap": 0.35,
+    "use_ollama_rank": true
   }
 }

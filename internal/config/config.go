@@ -12,6 +12,7 @@ type Config struct {
 	WorkDir  string        `json:"work_dir"`
 	FFmpeg   string        `json:"ffmpeg"`
 	FFprobe  string        `json:"ffprobe"`
+	YTDLP    string        `json:"yt_dlp"`
 	Whisper  WhisperConfig `json:"whisper"`
 	Ollama   OllamaConfig  `json:"ollama"`
 	Output   OutputConfig  `json:"output"`
@@ -19,6 +20,7 @@ type Config struct {
 	Captions CaptionConfig `json:"captions"`
 	Zoom     ZoomConfig    `json:"zoom"`
 	Broll    BrollConfig   `json:"broll"`
+	Shorts   ShortsConfig  `json:"shorts"`
 }
 
 type WhisperConfig struct {
@@ -82,6 +84,18 @@ type ZoomConfig struct {
 	Duration float64 `json:"duration"`
 }
 
+type ShortsConfig struct {
+	Enabled       bool    `json:"enabled"`
+	MinDuration   float64 `json:"min_duration"`
+	IdealMin      float64 `json:"ideal_min"`
+	IdealMax      float64 `json:"ideal_max"`
+	MaxDuration   float64 `json:"max_duration"`
+	DefaultCount  int     `json:"default_count"`
+	MaxCount      int     `json:"max_count"`
+	MaxOverlap    float64 `json:"max_overlap"`
+	UseOllamaRank bool    `json:"use_ollama_rank"`
+}
+
 type BrollConfig struct {
 	Enabled   bool   `json:"enabled"`
 	AssetDir  string `json:"asset_dir"`
@@ -103,12 +117,14 @@ func Default() Config {
 		WorkDir:  "./data",
 		FFmpeg:   "ffmpeg",
 		FFprobe:  "ffprobe",
+		YTDLP:    "yt-dlp",
 		Whisper:  WhisperConfig{Binary: "whisper-cli", Model: "./models/ggml-large-v3-turbo.bin", Language: "pt", Prompt: "Português brasileiro. Tecnologia, inteligência artificial, IA, programação, software, engenharia de software, Java, Spring Boot, ChatGPT, OpenAI, Claude, Gemini, Docker, Kubernetes, GitHub, LinkedIn, Instagram, TikTok, YouTube.", Threads: 0},
 		Ollama:   OllamaConfig{Enabled: true, URL: "http://127.0.0.1:11434", Model: "qwen3:8b"},
 		Output:   OutputConfig{Width: 1080, Height: 1920, FPS: 30, CRF: 18, Preset: "medium", AudioBitrate: "192k"},
 		Cuts:     CutConfig{Enabled: true, NoiseDB: -42, MinSilence: 1.10, KeepSilence: 0.25, MinKeepSegment: 0.20},
 		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 74, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 5, Shadow: 0, MarginV: 560, SafeMargin: 112, MaxWords: 6, MaxCharsPerLine: 22, MaxLines: 2, Uppercase: true, ActiveWord: true, TimingOffset: 0.06, ActiveScale: 1.05, MaxWidthRatio: 0.80},
 		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Emphasis: 1.085, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
+		Shorts:   ShortsConfig{Enabled: true, MinDuration: 30, IdealMin: 40, IdealMax: 50, MaxDuration: 55, DefaultCount: 5, MaxCount: 10, MaxOverlap: 0.35, UseOllamaRank: true},
 		Broll: BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 12,
 			MinVisualGap: 0.35, Remote: true, Procedural: true, AllowSelfBroll: true, MaxRemoteMB: 60,
 			ReactionSplit: 0.5, ReactionFocusY: 0.40, SeamCaptions: true},
@@ -157,6 +173,30 @@ func (c *Config) Normalize(base string) error {
 	}
 	if c.Captions.TimingOffset < -0.20 || c.Captions.TimingOffset > 0.35 {
 		c.Captions.TimingOffset = 0.06
+	}
+	if c.YTDLP == "" {
+		c.YTDLP = "yt-dlp"
+	}
+	if c.Shorts.MinDuration <= 0 {
+		c.Shorts.MinDuration = 30
+	}
+	if c.Shorts.IdealMin < c.Shorts.MinDuration {
+		c.Shorts.IdealMin = mathMax(c.Shorts.MinDuration, 40)
+	}
+	if c.Shorts.IdealMax < c.Shorts.IdealMin {
+		c.Shorts.IdealMax = mathMax(c.Shorts.IdealMin, 50)
+	}
+	if c.Shorts.MaxDuration < c.Shorts.IdealMax {
+		c.Shorts.MaxDuration = mathMax(c.Shorts.IdealMax, 55)
+	}
+	if c.Shorts.DefaultCount <= 0 {
+		c.Shorts.DefaultCount = 5
+	}
+	if c.Shorts.MaxCount < c.Shorts.DefaultCount {
+		c.Shorts.MaxCount = 10
+	}
+	if c.Shorts.MaxOverlap <= 0 || c.Shorts.MaxOverlap >= 1 {
+		c.Shorts.MaxOverlap = 0.35
 	}
 	if c.Broll.MinVisualGap <= 0 {
 		c.Broll.MinVisualGap = 0.35
@@ -216,4 +256,11 @@ func LoadEnvFile(path string) error {
 		_ = os.Setenv(key, value)
 	}
 	return nil
+}
+
+func mathMax(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }

@@ -23,12 +23,31 @@ import (
 
 type Progress func(stage string, percent int, detail string)
 
+type RunOptions struct {
+	Mode     string
+	Reaction *ReactionOptions
+}
+
+type ReactionOptions struct {
+	Path      string
+	AudioMode string // muted | duck | original
+}
+
+const (
+	ModeAuto     = "auto"
+	ModeReaction = "reaction"
+)
+
 type Result struct {
 	Output, ASS, TranscriptJSON, PlanJSON, DebugLog, AttributionJSON string
 	OriginalDuration, FinalDuration                                  float64
 }
 
-func Run(ctx context.Context, cfg config.Config, input, outDir string, progress Progress) (result Result, err error) {
+func Run(ctx context.Context, cfg config.Config, input, outDir string, progress Progress) (Result, error) {
+	return RunWithOptions(ctx, cfg, input, outDir, progress, RunOptions{Mode: ModeAuto})
+}
+
+func RunWithOptions(ctx context.Context, cfg config.Config, input, outDir string, progress Progress, opts RunOptions) (result Result, err error) {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return Result{}, err
 	}
@@ -83,7 +102,11 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	logger.Info("transcript.summary", "language", tr.Language, "segments", len(tr.Segments), "tokens", len(tr.Tokens), "text", transcriptText(tr))
 
 	keep := []silence.Interval{{Start: 0, End: info.Duration}}
-	if cfg.Cuts.Enabled {
+	cutSilence := cfg.Cuts.Enabled && opts.Mode != ModeReaction
+	if opts.Mode == ModeReaction && cfg.Cuts.Enabled {
+		logger.Info("reaction.sync", "silence_cuts", false, "reason", "preservar sincronismo entre creator e vídeo reagido")
+	}
+	if cutSilence {
 		p("silence", 40, "detectando e encurtando silêncios")
 		ss, detectErr := silence.Detect(ctx, cfg.FFmpeg, input, cfg.Cuts.NoiseDB, cfg.Cuts.MinSilence)
 		if detectErr != nil {
@@ -111,6 +134,24 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	stageStart := time.Now()
 	plan := planner.HeuristicCtx(ctx, mapped, cfg)
 	plan = planner.WithOllama(ctx, plan, mapped, cfg)
+	if opts.Mode == ModeReaction {
+		if opts.Reaction == nil || strings.TrimSpace(opts.Reaction.Path) == "" {
+			return Result{}, fmt.Errorf("reaction mode requer vídeo de reação")
+		}
+		reactionInfo, probeErr := media.Probe(ctx, cfg.FFprobe, opts.Reaction.Path)
+		if probeErr != nil {
+			return Result{}, fmt.Errorf("vídeo de reação inválido: %w", probeErr)
+		}
+		audioMode := normalizeReactionAudioMode(opts.Reaction.AudioMode)
+		plan.VisualEvents = []planner.VisualEvent{{
+			ID: "reaction-001", Start: 0, End: cutInfo.Duration, Type: planner.TypeBroll,
+			Concept: "manual reaction", Label: "REAÇÃO", Layout: planner.LayoutReaction,
+			Importance: 1, Relevance: 1, Origin: "manual", Reason: "layout de reação escolhido pelo usuário",
+			Asset: &planner.AssetRef{Path: opts.Reaction.Path, Type: "video", Source: planner.SourceManual, Duration: reactionInfo.Duration, AudioMode: audioMode},
+		}}
+		plan.SFX = nil
+		logger.Info("reaction.plan", "asset", opts.Reaction.Path, "asset_duration_s", reactionInfo.Duration, "timeline_duration_s", cutInfo.Duration, "audio_mode", audioMode)
+	}
 	logger.Info("stage.timing", "stage", "plan", "duration_ms", time.Since(stageStart).Milliseconds())
 	logger.Info("edit.plan.pre_assets", "visual_events", len(plan.VisualEvents), "zooms", len(plan.Zooms), "sfx", len(plan.SFX), "emphasis", len(plan.Emphasis), "json", planner.DebugJSON(plan))
 
@@ -119,7 +160,11 @@ func Run(ctx context.Context, cfg config.Config, input, outDir string, progress 
 	resolver := assets.NewFromConfig(cfg)
 	plan, resolvedAssets := resolver.ResolvePlan(ctx, plan)
 	// Events dropped by the resolver must not leave orphan sound effects.
-	plan.SFX = planner.PlanSFX(plan.VisualEvents)
+	if opts.Mode == ModeReaction {
+		plan.SFX = nil
+	} else {
+		plan.SFX = planner.PlanSFX(plan.VisualEvents)
+	}
 	logger.Info("stage.timing", "stage", "assets", "duration_ms", time.Since(stageStart).Milliseconds())
 	attributionPath := filepath.Join(outDir, "assets-attribution.json")
 	if err := assets.WriteAttributions(attributionPath, resolvedAssets); err != nil {
@@ -201,6 +246,19 @@ func captionWindows(cfg config.Config, plan planner.Plan) []captions.Window {
 		}
 	}
 	return ws
+}
+
+func normalizeReactionAudioMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "duck", "low", "baixo":
+		return "duck"
+	case "muted", "mute", "off", "desligado":
+		return "muted"
+	case "original", "mix":
+		return "original"
+	default:
+		return "duck"
+	}
 }
 
 func intervalsDuration(xs []silence.Interval) float64 {

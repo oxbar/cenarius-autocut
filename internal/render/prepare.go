@@ -46,8 +46,8 @@ func PrepareClip(ctx context.Context, cfg config.Config, a planner.AssetRef, spe
 			}
 		}
 		offset := 0.0
-		if src > dur+0.6 {
-			// Skip the typical fade-in/slate at the head of stock footage.
+		if a.Source != planner.SourceManual && src > dur+0.6 {
+			// Skip the typical fade-in/slate at the head of stock footage. Manual reactions must start at 0 to stay synced.
 			offset = math.Min(1.0, (src-dur)*0.25)
 		}
 		if src > 0 && src-offset < dur {
@@ -87,6 +87,34 @@ func PrepareClip(ctx context.Context, cfg config.Config, a planner.AssetRef, spe
 	}
 	args = append(args, "-filter_complex", chain, "-map", "[v]", "-an", "-frames:v", strconv.Itoa(frames),
 		"-r", strconv.Itoa(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", out)
+	if _, err := execx.Run(ctx, nil, cfg.FFmpeg, args...); err != nil {
+		_ = os.Remove(out)
+		return err
+	}
+	return nil
+}
+
+// PrepareReactionAudio normalises the audio of a user-provided reaction video
+// to a finite AAC track matching the visual event duration. It intentionally
+// keeps the original timing (no silence removal) so creator/reaction remain in
+// sync. Short sources loop only when they cannot cover the requested duration.
+func PrepareReactionAudio(ctx context.Context, cfg config.Config, a planner.AssetRef, duration float64, out string) error {
+	if duration <= 0 || a.Path == "" {
+		return fmt.Errorf("reaction audio inválido")
+	}
+	src := a.Duration
+	if src <= 0 {
+		if info, err := media.Probe(ctx, cfg.FFprobe, a.Path); err == nil {
+			src = info.Duration
+		}
+	}
+	args := []string{"-hide_banner", "-y"}
+	if src > 0 && src < duration {
+		loops := int(math.Ceil(duration/src)) + 1
+		args = append(args, "-stream_loop", strconv.Itoa(loops))
+	}
+	args = append(args, "-i", a.Path, "-vn", "-t", fmt.Sprintf("%.3f", duration),
+		"-af", "aresample=48000,asetpts=N/SR/TB", "-c:a", "aac", "-b:a", cfg.Output.AudioBitrate, "-ar", "48000", out)
 	if _, err := execx.Run(ctx, nil, cfg.FFmpeg, args...); err != nil {
 		_ = os.Remove(out)
 		return err
