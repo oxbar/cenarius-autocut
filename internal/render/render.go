@@ -15,6 +15,7 @@ import (
 	"cenarius-autocut/internal/config"
 	"cenarius-autocut/internal/execx"
 	"cenarius-autocut/internal/logx"
+	"cenarius-autocut/internal/media"
 	"cenarius-autocut/internal/planner"
 	"cenarius-autocut/internal/silence"
 )
@@ -149,6 +150,24 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 		items = append(items, it)
 	}
 
+	// Music bed: looped exactly to the timeline length (finite input, so it
+	// can never extend the video), only when the voice track exists.
+	musicIdx := -1
+	timeline := 0.0
+	var musicCue *planner.MusicCue
+	if hasAudio && plan.Music != nil && plan.Music.Asset != nil && plan.Music.Asset.Path != "" {
+		if info, err := media.Probe(ctx, cfg.FFprobe, input); err == nil && info.Duration > 0 {
+			musicCue, timeline = plan.Music, info.Duration
+			args = append(args, "-stream_loop", "-1", "-t", fmt.Sprintf("%.3f", info.Duration+0.5), "-i", plan.Music.Asset.Path)
+			musicIdx = next
+			next++
+			logger.Info("audio.music.render", "mood", musicCue.Mood, "path", musicCue.Asset.Path, "gain_db", musicCue.GainDB,
+				"duck", cfg.Music.Duck, "drops", len(musicCue.Drops), "timeline_s", info.Duration)
+		} else {
+			logger.Warn("audio.music.skipped", "reason", "não foi possível medir a timeline", "error", err)
+		}
+	}
+
 	var fc strings.Builder
 	fmt.Fprintf(&fc, "[0:v]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1,eq=contrast=1.03:saturation=1.04,unsharp=5:5:0.25,fps=%d", W, H, W, H, fps)
 	if cfg.Zoom.Enabled && len(plan.Zooms) > 0 {
@@ -244,11 +263,20 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 		}
 		voiceLabel := "[0:a]"
 		duckKeys := make([]string, len(duckItems))
-		if len(duckItems) > 0 {
-			fmt.Fprintf(&fc, ";[0:a]asplit=%d[voicebase]", len(duckItems)+1)
+		musicKey := ""
+		keys := len(duckItems)
+		if musicIdx >= 0 && cfg.Music.Duck {
+			keys++
+		}
+		if keys > 0 {
+			fmt.Fprintf(&fc, ";[0:a]asplit=%d[voicebase]", keys+1)
 			for i := range duckItems {
 				duckKeys[i] = fmt.Sprintf("[voicekey%d]", i)
 				fc.WriteString(duckKeys[i])
+			}
+			if musicIdx >= 0 && cfg.Music.Duck {
+				musicKey = "[voicekeymusic]"
+				fc.WriteString(musicKey)
 			}
 			voiceLabel = "[voicebase]"
 		}
@@ -271,6 +299,11 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 			}
 			labels = append(labels, base)
 			logger.Info("reaction.audio.event", "event", it.e.ID, "mode", it.e.Asset.AudioMode, "start", it.e.Start)
+		}
+
+		if musicIdx >= 0 {
+			fmt.Fprintf(&fc, ";%s", MusicChain(musicIdx, musicCue, musicKey, timeline))
+			labels = append(labels, "[music]")
 		}
 
 		for i, sfx := range plan.SFX {
@@ -318,11 +351,61 @@ func sfxSource(name string) string {
 		return "anoisesrc=color=pink:sample_rate=48000:duration=0.30,highpass=f=500,lowpass=f=6000,afade=t=in:st=0:d=0.05,afade=t=out:st=0.12:d=0.17"
 	case "click":
 		return "sine=frequency=2600:sample_rate=48000:duration=0.03,afade=t=out:st=0.005:d=0.025"
+	case "hit": // short punchy low hit for the hook
+		return "aevalsrc='0.8*sin(2*PI*80*t)*exp(-9*t)':s=48000:d=0.35,afade=t=out:st=0.2:d=0.15"
+	case "impact": // cinematic boom that lands a punchline
+		return "aevalsrc='0.9*sin(2*PI*50*t)*exp(-3.5*t)+0.35*sin(2*PI*100*t)*exp(-6*t)':s=48000:d=1.1,lowpass=f=900,afade=t=out:st=0.7:d=0.4"
+	case "riser": // rising sweep that builds tension into a drop
+		return "aevalsrc='0.35*sin(2*PI*(220*t+700*t*t))*(t/0.9)':s=48000:d=0.9,highpass=f=150,afade=t=in:st=0:d=0.3"
 	case "beep", "error":
 		return "sine=frequency=1000:sample_rate=48000:duration=0.14,afade=t=in:st=0:d=0.01,afade=t=out:st=0.09:d=0.05"
 	default: // pop
 		return "sine=frequency=920:sample_rate=48000:duration=0.09,afade=t=out:st=0.035:d=0.055"
 	}
+}
+
+// MusicChain builds the music bed filter: stereo 48 kHz, base gain, 1.2 s
+// fade-in, 1.8 s fade-out, drops (music cut to ~5%% with a 0.4 s recovery) at
+// punchlines and, when key is set, sidechain ducking under the voice so the
+// speech always stays on top. Output label: [music].
+func MusicChain(idx int, cue *planner.MusicCue, key string, timeline float64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=%.1fdB,afade=t=in:st=0:d=1.2", idx, ClampMusicGain(cue.GainDB))
+	if timeline > 3 {
+		fmt.Fprintf(&b, ",afade=t=out:st=%.3f:d=1.8", timeline-1.8)
+	}
+	if expr := DropExpr(cue.Drops); expr != "1" {
+		fmt.Fprintf(&b, ",volume='%s':eval=frame", expr)
+	}
+	if key != "" {
+		b.WriteString("[musicraw];[musicraw]" + key + "sidechaincompress=threshold=0.02:ratio=8:attack=20:release=350:makeup=1[music]")
+	} else {
+		b.WriteString("[music]")
+	}
+	return b.String()
+}
+
+// DropExpr is the volume envelope for music drops (1 = untouched).
+func DropExpr(drops []planner.MusicDrop) string {
+	expr := "1"
+	for i := len(drops) - 1; i >= 0; i-- {
+		d := drops[i]
+		if d.End <= d.Start {
+			continue
+		}
+		// Commas are safe: the whole expression is single-quoted in the graph.
+		expr = fmt.Sprintf("if(between(t,%.3f,%.3f),0.05,if(between(t,%.3f,%.3f),0.05+0.95*(t-%.3f)/0.4,%s))",
+			d.Start, d.End, d.End, d.End+0.4, d.End, expr)
+	}
+	return expr
+}
+
+// ClampMusicGain keeps the bed under the voice: -30..-14 dB before ducking.
+func ClampMusicGain(g float64) float64 {
+	if g == 0 {
+		g = -20
+	}
+	return math.Max(-30, math.Min(-14, g))
 }
 
 func firstNonEmpty(xs ...string) string {

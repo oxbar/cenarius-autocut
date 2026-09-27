@@ -21,6 +21,24 @@ type Config struct {
 	Zoom     ZoomConfig    `json:"zoom"`
 	Broll    BrollConfig   `json:"broll"`
 	Shorts   ShortsConfig  `json:"shorts"`
+	Music    MusicConfig   `json:"music"`
+}
+
+// MusicConfig controls the emotional sound layer: a mood-matched music bed
+// ducked under the voice, "drops" at punchlines and riser/impact accents.
+// Sources are licence-safe only: a local library (e.g. tracks you downloaded
+// from the YouTube Audio Library or bought) and Openverse CC audio.
+type MusicConfig struct {
+	Enabled    bool    `json:"enabled"`
+	File       string  `json:"file"`        // force a specific track (CLI -music)
+	Mood       string  `json:"mood"`        // auto | energetic | inspiring | tense | dramatic | chill | funny
+	Library    string  `json:"library"`     // folder with local tracks
+	Manifest   string  `json:"manifest"`    // moods/licence of local tracks
+	Remote     bool    `json:"remote"`      // Openverse CC music (no key)
+	GainDB     float64 `json:"gain_db"`     // bed level before ducking (-30..-14)
+	Duck       bool    `json:"duck"`        // sidechain the bed under the voice
+	Drops      bool    `json:"drops"`       // cut the music at punchlines
+	EmotionSFX bool    `json:"emotion_sfx"` // riser before / impact on punchlines
 }
 
 type WhisperConfig struct {
@@ -125,6 +143,8 @@ func Default() Config {
 		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 74, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 5, Shadow: 0, MarginV: 560, SafeMargin: 112, MaxWords: 6, MaxCharsPerLine: 22, MaxLines: 2, Uppercase: true, ActiveWord: true, TimingOffset: 0.06, ActiveScale: 1.05, MaxWidthRatio: 0.80},
 		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Emphasis: 1.085, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
 		Shorts:   ShortsConfig{Enabled: true, MinDuration: 30, IdealMin: 40, IdealMax: 50, MaxDuration: 55, DefaultCount: 5, MaxCount: 10, MaxOverlap: 0.35, UseOllamaRank: true},
+		Music: MusicConfig{Enabled: true, Mood: "auto", Library: "./assets/music", Manifest: "./assets/music/manifest.json",
+			Remote: true, GainDB: -20, Duck: true, Drops: true, EmotionSFX: true},
 		Broll: BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 12,
 			MinVisualGap: 0.35, Remote: true, Procedural: true, AllowSelfBroll: true, MaxRemoteMB: 60,
 			ReactionSplit: 0.5, ReactionFocusY: 0.40, SeamCaptions: true},
@@ -209,6 +229,21 @@ func (c *Config) Normalize(base string) error {
 	}
 	if c.Broll.MaxRemoteMB <= 0 {
 		c.Broll.MaxRemoteMB = 60
+	}
+	c.Music.Mood = strings.ToLower(strings.TrimSpace(c.Music.Mood))
+	switch c.Music.Mood {
+	case "auto", "energetic", "inspiring", "tense", "dramatic", "chill", "funny":
+	default:
+		c.Music.Mood = "auto"
+	}
+	if c.Music.GainDB == 0 || c.Music.GainDB < -30 || c.Music.GainDB > -14 {
+		c.Music.GainDB = -20
+	}
+	if c.Music.Library == "" {
+		c.Music.Library = "./assets/music"
+	}
+	if c.Music.Manifest == "" {
+		c.Music.Manifest = filepath.Join(c.Music.Library, "manifest.json")
 	}
 	if c.Zoom.Emphasis <= 1 {
 		c.Zoom.Emphasis = 1.085

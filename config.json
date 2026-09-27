@@ -82,5 +82,17 @@
     "max_count": 10,
     "max_overlap": 0.35,
     "use_ollama_rank": true
+  },
+  "music": {
+    "enabled": true,
+    "file": "",
+    "mood": "auto",
+    "library": "./assets/music",
+    "manifest": "./assets/music/manifest.json",
+    "remote": true,
+    "gain_db": -20,
+    "duck": true,
+    "drops": true,
+    "emotion_sfx": true
   }
 }

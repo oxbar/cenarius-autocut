@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CENARIUS AutoCut v1.7 visual smoke test.
+# CENARIUS AutoCut v1.8 visual + audio smoke test.
 # Runs the full pipeline (probe -> audio -> whisper stub -> semantic planner ->
 # asset resolver -> render) offline and checks that the output really is a
 # smart edit: A-roll + captions + zoom + video B-roll + Ken Burns still +
@@ -36,6 +36,15 @@ fail() { echo "SMOKE FALHOU: $*" >&2; exit 1; }
   -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$TMP/assets/technology.mp4"
 "$FFMPEG_BIN" -hide_banner -loglevel error -y \
   -f lavfi -i "mandelbrot=size=1200x800:rate=1" -frames:v 1 "$TMP/assets/java.png"
+# Local licence-safe music bed (20 s chord). The manifest lists every mood so
+# whatever mood the planner detects resolves to this track (no network).
+mkdir -p "$TMP/music"
+"$FFMPEG_BIN" -hide_banner -loglevel error -y \
+  -f lavfi -i "aevalsrc='0.2*sin(2*PI*220*t)+0.15*sin(2*PI*277*t)+0.12*sin(2*PI*330*t)':s=48000:d=20" \
+  -c:a pcm_s16le "$TMP/music/bed.wav"
+cat > "$TMP/music/manifest.json" <<JSON
+{"tracks":[{"file":"bed.wav","title":"Smoke Bed","moods":["energetic","inspiring","tense","dramatic","chill","funny"],"license":"CC0 (smoke)","author":"CENARIUS"}]}
+JSON
 cat > "$TMP/manifest.json" <<JSON
 {"assets":[
  {"keyword":"tecnologia","aliases":["tecnologias"],"concepts":["technology"],"file":"technology.mp4","license":"CC0 (smoke)"},
@@ -74,7 +83,9 @@ cat > "$TMP/config.json" <<JSON
   "captions": {"enabled":true,"font_name":"Arial","font_size":74,"primary_color":"&H00FFFFFF","highlight_color":"&H0000D7FF","outline_color":"&H00000000","outline":5,"shadow":0,"margin_v":560,"safe_margin":112,"max_words":6,"max_chars_per_line":22,"uppercase":true,"active_word":true,"timing_offset":0.06,"active_scale":1.05,"max_width_ratio":0.80},
   "zoom": {"enabled":true,"mild":1.06,"emphasis":1.085,"punch":1.10,"min_gap":3.0,"duration":0.85},
   "broll": {"enabled":true,"asset_dir":"$TMP/assets","manifest":"$TMP/manifest.json","max_events":5,
-            "min_visual_gap":0.35,"remote":false,"procedural":true,"allow_self_broll":true}
+            "min_visual_gap":0.35,"remote":false,"procedural":true,"allow_self_broll":true},
+  "music": {"enabled":true,"mood":"auto","library":"$TMP/music","manifest":"$TMP/music/manifest.json",
+            "remote":false,"gain_db":-20,"duck":true,"drops":true,"emotion_sfx":true}
 }
 JSON
 mkdir -p "$ROOT/bin"
@@ -115,6 +126,12 @@ grep -q 'msg=visual.render.event.*media_type=image' "$LOG" || fail "render de im
 grep -q 'msg=visual.render.complete' "$LOG" || fail "visual.render.complete ausente"
 grep -q 'msg=audio.sfx.event' "$LOG" || fail "SFX não renderizado"
 grep -q 'msg=planner.semantic_unit' "$LOG" || fail "planner semântico não registrado"
+grep -q 'msg=audio.music.plan' "$LOG" || fail "mood/trilha não planejados"
+grep -q 'msg=audio.music.resolved.*tier=local' "$LOG" || fail "trilha local não resolvida"
+grep -q 'msg=audio.music.render' "$LOG" || fail "trilha não mixada no render"
+grep -q 'sidechaincompress' "$OUT.filter" || fail "trilha sem ducking sob a voz"
+grep -q '"mood": "' "$PLAN" || fail "edit-plan sem mood da trilha"
+grep -q '"name": "hit"' "$PLAN" || grep -q '"name": "impact"' "$PLAN" || fail "nenhum SFX emocional no plano"
 grep -q 'msg=visual.schedule.after' "$LOG" || fail "scheduler visual não registrado"
 grep -Eiq 'latitude|longitude|ISO6709|quicktime\.location' "$LOG" && fail "debug.log contém metadados de localização"
 python3 - "$PLAN" <<'PY' || fail "eventos visuais sobrepostos ou fora do ritmo"

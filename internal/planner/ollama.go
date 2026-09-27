@@ -25,6 +25,7 @@ type DirectorResponse struct {
 	VisualEvents []directorEvent `json:"visual_events"`
 	Zooms        []ZoomEvent     `json:"zooms"`
 	Emphasis     []string        `json:"emphasis"`
+	MusicMood    string          `json:"music_mood"`
 	// Legacy (v1.5) answers are still understood.
 	Overlays []OverlayEvent `json:"overlays"`
 }
@@ -50,7 +51,8 @@ Responda SOMENTE com JSON válido, sem markdown, sem texto extra, exatamente nes
 {"hook":"frase do gancho","cta":"frase de CTA ou vazio",
  "visual_events":[{"unit_id":"u02","start":3.2,"end":5.6,"type":"broll","concept":"software development","queries":["software developer programming computer","programmer coding","source code on computer screen"],"layout":"reaction","importance":0.82,"reason":"ilustra diretamente a explicação"}],
  "zooms":[{"start":0.0,"end":0.9,"kind":"punch_zoom","scale":1.08,"reason":"gancho"}],
- "emphasis":["PALAVRA"]}
+ "emphasis":["PALAVRA"],
+ "music_mood":"energetic"}
 
 REGRAS:
 - Analise cada unidade com a anterior e a seguinte: gancho, explicação, exemplo, punchline, mudança de ideia, CTA, emoção.
@@ -65,6 +67,7 @@ REGRAS:
 - importance 0-1: conceito central da fala > menção de passagem.
 - zooms: kind "punch_zoom" (ênfase, 1.08-1.12), "slow_push" (explicação longa, 1.055-1.07), "reframe" (mudança de ideia, 1.06-1.08). No máximo 4. Não coloque zoom dentro de fullscreen.
 - emphasis: no máximo 3 palavras que devem ser destacadas na legenda.
+- music_mood: emoção da trilha de fundo para o reel inteiro, uma de: energetic, inspiring, tense, dramatic, chill, funny.
 - Use os tempos exatos das palavras.
 
 UNIDADES SEMÂNTICAS (id, início, fim, papel sugerido, conceitos detectados, texto):
@@ -134,6 +137,9 @@ func WithOllama(ctx context.Context, base Plan, tr transcribe.Transcript, cfg co
 	merged := base
 	merged.VisualEvents = append(append([]VisualEvent(nil), ai.VisualEvents...), base.VisualEvents...)
 	merged.Emphasis = append(append([]string(nil), ai.Emphasis...), base.Emphasis...)
+	if ai.Music != nil {
+		merged.Music = ai.Music
+	}
 	if ai.Hook != "" {
 		merged.Hook = ai.Hook
 	}
@@ -161,6 +167,9 @@ func ParseDirector(raw string, tr transcribe.Transcript, units []SemanticUnit, c
 		return Plan{}, fmt.Errorf("transcrição vazia")
 	}
 	p := Plan{Hook: strings.TrimSpace(d.Hook), CTA: strings.TrimSpace(d.CTA)}
+	if m := strings.ToLower(strings.TrimSpace(d.MusicMood)); IsMood(m) {
+		p.Music = &MusicCue{Mood: m}
+	}
 	for _, o := range d.Overlays {
 		d.VisualEvents = append(d.VisualEvents, directorEvent{Start: o.Start, End: o.End, Concept: o.Keyword, Query: o.Query, Layout: o.Mode, Reason: o.Reason, Importance: 0.65})
 	}
@@ -306,7 +315,7 @@ func validateDirectorEvent(e directorEvent, dur float64, wordStarts []float64, u
 		reason = "decisão do diretor"
 	}
 	return VisualEvent{
-		Start: round3(start), End: round3(end), Type: typ, Concept: concept, Label: label, Queries: qs,
+		Start: round3(start), End: round3(end), Type: typ, Concept: concept, Label: label, Queries: qs, Anchors: ConceptAnchors(concept),
 		Layout: layout, Importance: round3(imp), Relevance: round3(imp), Role: role, UnitID: unit,
 		Origin: "ollama", Reason: reason,
 	}, true

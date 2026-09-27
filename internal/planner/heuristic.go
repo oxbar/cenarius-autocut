@@ -115,7 +115,7 @@ func CandidatesFromUnits(units []SemanticUnit, dur float64) []VisualEvent {
 			}
 			out = append(out, VisualEvent{
 				Start: round3(start), End: round3(end), Type: typ, Concept: c.Name, Label: c.Label,
-				Queries: append([]string(nil), c.Queries...), Layout: layout,
+				Queries: append([]string(nil), c.Queries...), Anchors: ConceptAnchors(c.Name), Layout: layout,
 				Importance: round3(clamp(importance, 0, 1)), Relevance: round3(relevance),
 				Role: u.Role, UnitID: u.ID, Origin: "heuristic", Reason: reason,
 			})
@@ -189,6 +189,13 @@ func Finalize(ctx context.Context, p Plan, dur float64, cfg config.Config, seedZ
 		p.Zooms = nil
 	}
 	p.SFX = PlanSFX(p.VisualEvents)
+	p.Music = PlanMusic(p, dur, cfg.Music)
+	if cfg.Music.EmotionSFX {
+		p.SFX = mergeSFX(p.SFX, EmotionSFX(p, p.SFX))
+	}
+	if p.Music != nil {
+		logger.Info("audio.music.plan", "mood", p.Music.Mood, "reason", p.Music.Reason, "drops", len(p.Music.Drops), "queries", strings.Join(p.Music.Queries, "|"))
+	}
 	p.Emphasis = planEmphasis(p)
 	for _, u := range p.SemanticUnits {
 		if u.Role == RoleHook && p.Hook == "" {
@@ -369,6 +376,12 @@ func PlanSFX(events []VisualEvent) []SFXEvent {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Time < out[j].Time })
+	return out
+}
+
+func mergeSFX(a, b []SFXEvent) []SFXEvent {
+	out := append(append([]SFXEvent(nil), a...), b...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time < out[j].Time })
 	return out
 }
 

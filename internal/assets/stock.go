@@ -104,7 +104,7 @@ func (r *Resolver) searchPexels(ctx context.Context, query, kind, layout string)
 			if len(urls) == 0 {
 				continue
 			}
-			out = append(out, Candidate{Title: "Pexels video " + strconv.Itoa(v.ID), Page: v.URL, URLs: dedupe(urls), Mime: "video/mp4", Kind: "video",
+			out = append(out, Candidate{Title: "Pexels video " + strconv.Itoa(v.ID), Text: slugText(v.URL), Page: v.URL, URLs: dedupe(urls), Mime: "video/mp4", Kind: "video",
 				License: "Pexels License", Author: v.User.Name, Credit: "Pexels", Width: v.Width, Height: v.Height, Duration: v.Duration,
 				Score: stockSearchScore(v.Width, v.Height, v.Duration, i)})
 		}
@@ -133,7 +133,7 @@ func (r *Resolver) searchPexels(ctx context.Context, query, kind, layout string)
 			if len(urls) == 0 || p.Width < 480 || p.Height < 480 {
 				continue
 			}
-			out = append(out, Candidate{Title: firstNonEmpty(p.Alt, "Pexels photo "+strconv.Itoa(p.ID)), Page: p.URL, URLs: urls, Mime: "image/jpeg", Kind: "image",
+			out = append(out, Candidate{Title: firstNonEmpty(p.Alt, "Pexels photo "+strconv.Itoa(p.ID)), Text: slugText(p.URL), Page: p.URL, URLs: urls, Mime: "image/jpeg", Kind: "image",
 				License: "Pexels License", Author: p.Photographer, Credit: "Pexels", Width: p.Width, Height: p.Height,
 				Score: stockSearchScore(p.Width, p.Height, 0, i)})
 		}
@@ -226,7 +226,7 @@ func (r *Resolver) searchPixabay(ctx context.Context, query, kind, layout string
 			for _, x := range rs {
 				urls = append(urls, x.u)
 			}
-			out = append(out, Candidate{Title: firstNonEmpty(h.Tags, "Pixabay video "+strconv.Itoa(h.ID)), Page: h.PageURL, URLs: dedupe(urls), Mime: "video/mp4", Kind: "video",
+			out = append(out, Candidate{Title: firstNonEmpty(h.Tags, "Pixabay video "+strconv.Itoa(h.ID)), Text: slugText(h.PageURL), Page: h.PageURL, URLs: dedupe(urls), Mime: "video/mp4", Kind: "video",
 				License: "Pixabay Content License", Author: h.User, Credit: "Pixabay", Width: rs[0].w, Height: rs[0].h, Duration: h.Duration,
 				Score: stockSearchScore(rs[0].w, rs[0].h, h.Duration, i)})
 		}
@@ -251,7 +251,7 @@ func (r *Resolver) searchPixabay(ctx context.Context, query, kind, layout string
 			if len(urls) == 0 || h.ImageWidth < 480 || h.ImageHeight < 480 {
 				continue
 			}
-			out = append(out, Candidate{Title: firstNonEmpty(h.Tags, "Pixabay image "+strconv.Itoa(h.ID)), Page: h.PageURL, URLs: urls, Mime: "image/jpeg", Kind: "image",
+			out = append(out, Candidate{Title: firstNonEmpty(h.Tags, "Pixabay image "+strconv.Itoa(h.ID)), Text: slugText(h.PageURL), Page: h.PageURL, URLs: urls, Mime: "image/jpeg", Kind: "image",
 				License: "Pixabay Content License", Author: h.User, Credit: "Pixabay", Width: h.ImageWidth, Height: h.ImageHeight,
 				Score: stockSearchScore(h.ImageWidth, h.ImageHeight, 0, i)})
 		}

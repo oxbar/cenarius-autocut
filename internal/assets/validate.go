@@ -93,7 +93,56 @@ func (v FFValidator) Validate(ctx context.Context, path, kind string) (Media, er
 	if kind == "image" {
 		return v.validateImage(ctx, path, ct)
 	}
+	if kind == "audio" {
+		return v.validateAudio(ctx, path)
+	}
 	return v.validateVideo(ctx, path)
+}
+
+// validateAudio accepts a music track only if ffprobe finds an audio stream,
+// it lasts long enough to be a bed and a second of it really decodes.
+func (v FFValidator) validateAudio(ctx context.Context, path string) (Media, error) {
+	bin := v.FFprobe
+	if bin == "" {
+		bin = "ffprobe"
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, bin, "-v", "error", "-show_streams", "-show_format", "-of", "json", path).Output()
+	if err != nil {
+		return Media{}, fmt.Errorf("áudio inválido: ffprobe: %w", err)
+	}
+	var pj probeJSON
+	if err := json.Unmarshal(out, &pj); err != nil {
+		return Media{}, err
+	}
+	found := false
+	for _, st := range pj.Streams {
+		if st.CodecType == "audio" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return Media{}, fmt.Errorf("áudio inválido: nenhum stream de áudio")
+	}
+	d, _ := strconv.ParseFloat(pj.Format.Duration, 64)
+	if d < 5 {
+		return Media{}, fmt.Errorf("áudio curto demais para trilha: %.2fs", d)
+	}
+	ff := v.FFmpeg
+	if ff == "" {
+		ff = "ffmpeg"
+	}
+	dctx, dcancel := context.WithTimeout(ctx, 30*time.Second)
+	defer dcancel()
+	cmd := exec.CommandContext(dctx, ff, "-v", "error", "-xerror", "-t", "1", "-i", path, "-vn", "-f", "null", "-")
+	var er bytes.Buffer
+	cmd.Stderr = &er
+	if err := cmd.Run(); err != nil {
+		return Media{}, fmt.Errorf("áudio não decodifica: %w: %s", err, strings.TrimSpace(er.String()))
+	}
+	return Media{Type: "audio", Duration: d}, nil
 }
 
 func (v FFValidator) validateImage(ctx context.Context, path, ct string) (Media, error) {

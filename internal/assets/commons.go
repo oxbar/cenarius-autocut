@@ -48,6 +48,7 @@ type commonsResp struct {
 // Candidate is one remote file that passed metadata filtering.
 type Candidate struct {
 	Title    string
+	Text     string // provider description: alt text, tags or URL slug (semantic gate)
 	Page     string
 	URLs     []string // download attempts in order (derivatives/thumbs first)
 	Mime     string
@@ -352,7 +353,7 @@ func (r *Resolver) download(ctx context.Context, source, rawURL, kind string) (s
 		ext = strings.ToLower(filepath.Ext(strings.Split(rawURL, "?")[0]))
 	}
 	if ext == "" {
-		ext = map[string]string{"video": ".webm", "image": ".jpg"}[kind]
+		ext = map[string]string{"video": ".webm", "image": ".jpg", "audio": ".mp3"}[kind]
 	}
 	final := r.cache.MediaPath(source, rawURL, ext)
 	tmp := final + ".part"

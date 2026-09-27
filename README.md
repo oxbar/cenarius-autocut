@@ -114,6 +114,54 @@ cp .env.example .env
 
 FFmpeg: use o `ffmpeg-full` (libass + drawtext). O `ffmpeg` padrão do Homebrew não tem `drawtext`; nesse caso os motion graphics usam libass e o self-broll fica sem rótulo. Os testes escolhem `FFMPEG_BIN`/`FFPROBE_BIN`, depois `ffmpeg-full` do Homebrew, depois o PATH.
 
+## Emoção no áudio e stock inteligente (v1.8)
+
+### Trilha emocional
+
+O planner detecta o **mood** do reel pela fala (`energetic`, `inspiring`,
+`tense`, `dramatic`, `chill`, `funny`) — ou usa o mood escolhido pelo Ollama —
+e monta a camada sonora:
+
+- **Trilha de fundo** em loop exato na duração do vídeo, com fade in/out e
+  **ducking automático** (sidechain): abaixa sozinha quando você fala.
+- **Drop** nas punchlines: a música some por ~0,9 s e volta suave, para a frase
+  "cair". No máximo ~1 por 30 s, com 8 s de distância.
+- **Riser** subindo antes do drop, **impact** no drop e um **hit** no gancho.
+  Gerados pelo FFmpeg (sem licença envolvida), sempre entre −28 e −18 dB.
+
+Origem da trilha, nesta ordem:
+1. `-music arquivo.mp3` (ou `music.file`)
+2. biblioteca local `assets/music/manifest.json` filtrada pelo mood
+   (veja `assets/music/README.md` — ideal para faixas da YouTube Audio Library)
+3. cache
+4. **Openverse** (música CC0/CC BY/CC BY-SA do Jamendo/ccMixter, sem chave)
+
+Sem trilha válida o vídeo segue só com voz + efeitos. Créditos em
+`assets-attribution.json`. O modo reação não recebe trilha (o áudio do vídeo
+reagido já é a trilha).
+
+```bash
+./bin/cenarius edit -i video.mov -o ./data/out                 # mood automático
+./bin/cenarius edit -i video.mov -o ./data/out -mood tense     # força o mood
+./bin/cenarius edit -i video.mov -o ./data/out -music trilha.mp3
+./bin/cenarius edit -i video.mov -o ./data/out -no-music       # só voz
+```
+
+Config (`music`): `enabled`, `file`, `mood`, `library`, `manifest`, `remote`,
+`gain_db` (−30..−14, padrão −20), `duck`, `drops`, `emotion_sfx`.
+
+> Não extraia música de vídeos do YouTube: Instagram/TikTok/YouTube detectam o
+> áudio (Content ID) e podem silenciar, bloquear ou dar strike no reel.
+
+### Stock menos aleatório
+
+Pexels/Pixabay ordenam por popularidade, não só por significado. Agora todo
+resultado passa por um **portão semântico**: a query e as **âncoras visuais**
+do conceito (ex.: programação → code, laptop, keyboard, screen…) precisam
+aparecer no alt/tags/slug do resultado. Resultado fora do tema é descartado
+(`visual.asset.candidate accepted=false reason=off-topic` no `debug.log`) e o
+ranking passa a ser 60% significado + 40% formato/posição.
+
 ## Ajustando o estilo
 
 Tudo fica em `config.json`:

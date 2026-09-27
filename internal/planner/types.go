@@ -93,6 +93,7 @@ type VisualEvent struct {
 	Concept      string    `json:"concept"`
 	Label        string    `json:"label,omitempty"` // pt-BR on-screen label for motion graphics
 	Queries      []string  `json:"queries"`
+	Anchors      []string  `json:"anchors,omitempty"` // visual words a stock result must match
 	Layout       string    `json:"layout"`
 	Importance   float64   `json:"importance"`
 	Relevance    float64   `json:"relevance,omitempty"`
@@ -124,9 +125,38 @@ type Plan struct {
 	Overlays []OverlayEvent `json:"overlays,omitempty"`
 	SFX      []SFXEvent     `json:"sfx"`
 	Emphasis []string       `json:"emphasis"`
+	Music    *MusicCue      `json:"music,omitempty"`
 }
 
-const PlanVersion = "1.7"
+// Music moods (emotional direction of the whole reel).
+const (
+	MoodEnergetic = "energetic"
+	MoodInspiring = "inspiring"
+	MoodTense     = "tense"
+	MoodDramatic  = "dramatic"
+	MoodChill     = "chill"
+	MoodFunny     = "funny"
+)
+
+// MusicDrop silences the music bed for a moment so a punchline lands.
+type MusicDrop struct {
+	Start  float64 `json:"start"`
+	End    float64 `json:"end"`
+	Reason string  `json:"reason,omitempty"`
+}
+
+// MusicCue is the emotional sound direction: one mood-matched bed under the
+// voice (ducked while speaking) with dramatic drops.
+type MusicCue struct {
+	Mood    string      `json:"mood"`
+	Queries []string    `json:"queries,omitempty"`
+	GainDB  float64     `json:"gain_db"`
+	Drops   []MusicDrop `json:"drops,omitempty"`
+	Asset   *AssetRef   `json:"asset,omitempty"`
+	Reason  string      `json:"reason,omitempty"`
+}
+
+const PlanVersion = "1.8"
 
 // MigrateLegacy converts legacy overlays into visual events so old plans and
 // old-style Ollama answers keep working.

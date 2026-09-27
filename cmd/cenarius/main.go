@@ -36,6 +36,39 @@ func main() {
 		os.Exit(2)
 	}
 }
+
+// musicOpts are the emotional-audio flags shared by edit and shorts.
+type musicOpts struct {
+	file, mood *string
+	off        *bool
+}
+
+func musicFlags(fs *flag.FlagSet) musicOpts {
+	return musicOpts{
+		file: fs.String("music", "", "trilha de fundo específica (arquivo licenciado: sua, YouTube Audio Library, etc.)"),
+		mood: fs.String("mood", "", "emoção da trilha: auto|energetic|inspiring|tense|dramatic|chill|funny"),
+		off:  fs.Bool("no-music", false, "desativa trilha e efeitos emocionais"),
+	}
+}
+
+func (m musicOpts) apply(cfg *config.Config) {
+	if *m.off {
+		cfg.Music.Enabled, cfg.Music.EmotionSFX = false, false
+		return
+	}
+	if *m.file != "" {
+		if _, err := os.Stat(*m.file); err != nil {
+			fatal(fmt.Errorf("trilha -music não encontrada: %w", err))
+		}
+		cfg.Music.File = *m.file
+		cfg.Music.Enabled = true
+	}
+	if *m.mood != "" {
+		cfg.Music.Mood = *m.mood
+		_ = cfg.Normalize("") // validates the mood (unknown -> auto)
+	}
+}
+
 func load(path string) config.Config {
 	// Optional local secrets. Existing shell environment wins over .env.
 	if err := config.LoadEnvFile(filepath.Join(filepath.Dir(path), ".env")); err != nil {
@@ -63,11 +96,13 @@ func edit(args []string) {
 	c := fs.String("config", "config.json", "config")
 	in := fs.String("i", "", "vídeo de entrada")
 	out := fs.String("o", "", "diretório de saída")
+	mf := musicFlags(fs)
 	fs.Parse(args)
 	if *in == "" {
 		fatal(fmt.Errorf("use -i video.mp4"))
 	}
 	cfg := load(*c)
+	mf.apply(&cfg)
 	if *out == "" {
 		*out = filepath.Join(cfg.WorkDir, "cli")
 	}
@@ -112,11 +147,13 @@ func shortsCmd(args []string) {
 	out := fs.String("o", "", "diretório de saída")
 	count := fs.Int("count", 5, "quantidade de cortes")
 	generate := fs.Bool("generate", false, "gerar/editar todos os cortes selecionados")
+	mf := musicFlags(fs)
 	fs.Parse(args)
 	if *in == "" && *url == "" {
 		fatal(fmt.Errorf("use shorts -i video.mp4 ou shorts -url https://youtube.com/..."))
 	}
 	cfg := load(*c)
+	mf.apply(&cfg)
 	if *out == "" {
 		*out = filepath.Join(cfg.WorkDir, "shorts-cli")
 	}

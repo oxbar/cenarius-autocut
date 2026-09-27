@@ -145,8 +145,14 @@ func TestSchedulingRhythmForTypicalShort(t *testing.T) {
 			t.Fatalf("zoom scale out of range: %+v", z)
 		}
 	}
-	if len(p.SFX) >= n && n > 1 {
-		t.Fatalf("SFX on every insert (%d sfx for %d events)", len(p.SFX), n)
+	insertSFX := 0
+	for _, s := range p.SFX {
+		if !IsEmotionSFX(s.Name) {
+			insertSFX++
+		}
+	}
+	if insertSFX >= n && n > 1 {
+		t.Fatalf("SFX on every insert (%d insert sfx for %d events)", insertSFX, n)
 	}
 	if p.CTA == "" {
 		t.Fatalf("CTA unit not detected")
@@ -302,5 +308,13 @@ func TestRhythmBudgetPrefersDistinctConcepts(t *testing.T) {
 			t.Fatalf("budget reused concept despite alternatives: %+v", out)
 		}
 		seen[e.Concept] = true
+	}
+}
+
+func TestEveryLexiconConceptHasAnchors(t *testing.T) {
+	for _, c := range conceptLexicon {
+		if len(ConceptAnchors(c.Name)) < 3 {
+			t.Fatalf("concept %q needs >=3 visual anchors", c.Name)
+		}
 	}
 }

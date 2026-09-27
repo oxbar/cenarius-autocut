@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -162,8 +163,26 @@ func RunWithOptions(ctx context.Context, cfg config.Config, input, outDir string
 	// Events dropped by the resolver must not leave orphan sound effects.
 	if opts.Mode == ModeReaction {
 		plan.SFX = nil
+		plan.Music = nil // the reacted video's own audio is the soundtrack
 	} else {
 		plan.SFX = planner.PlanSFX(plan.VisualEvents)
+		if cfg.Music.EmotionSFX {
+			plan.SFX = append(plan.SFX, planner.EmotionSFX(plan, plan.SFX)...)
+			sort.SliceStable(plan.SFX, func(i, j int) bool { return plan.SFX[i].Time < plan.SFX[j].Time })
+		}
+	}
+	if plan.Music != nil && cutInfo.HasAudio {
+		p("music", 70, "escolhendo trilha emocional ("+plan.Music.Mood+")")
+		musicStart := time.Now()
+		ref, musicAsset, merr := resolver.ResolveMusic(ctx, plan.Music, cfg.Music)
+		if merr != nil {
+			// Not fatal: the reel keeps voice + emotional SFX.
+			logger.Warn("audio.music.fallback", "mood", plan.Music.Mood, "fallback", "sem trilha", "error", merr)
+		} else {
+			plan.Music.Asset = ref
+			resolvedAssets = append(resolvedAssets, *musicAsset)
+		}
+		logger.Info("stage.timing", "stage", "music", "duration_ms", time.Since(musicStart).Milliseconds())
 	}
 	logger.Info("stage.timing", "stage", "assets", "duration_ms", time.Since(stageStart).Milliseconds())
 	attributionPath := filepath.Join(outDir, "assets-attribution.json")

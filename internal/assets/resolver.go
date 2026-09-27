@@ -82,6 +82,7 @@ type Resolver struct {
 	API            string // Wikimedia Commons API (kept for backwards-compatible tests)
 	PexelsAPI      string
 	PixabayAPI     string
+	OpenverseAPI   string // Openverse (CC music), no key required
 	PexelsKey      string
 	PixabayKey     string
 	Client         *http.Client
@@ -157,6 +158,9 @@ func (r *Resolver) init() {
 	}
 	if r.PixabayAPI == "" {
 		r.PixabayAPI = defaultPixabayAPI
+	}
+	if r.OpenverseAPI == "" {
+		r.OpenverseAPI = defaultOpenverse
 	}
 }
 
@@ -429,8 +433,12 @@ func (r *Resolver) remoteProvider(ctx context.Context, e planner.VisualEvent, qu
 	if err != nil {
 		return Asset{}, transientErr{err}
 	}
+	if provider == SourcePexels || provider == SourcePixabay {
+		// Stock APIs rank by popularity too; keep only on-topic results.
+		cands = rankBySemantics(ctx, provider, e, query, cands)
+	}
 	if len(cands) == 0 {
-		return Asset{}, fmt.Errorf("%s: nenhum candidato %s para %q", provider, kind, query)
+		return Asset{}, fmt.Errorf("%s: nenhum candidato %s relevante para %q", provider, kind, query)
 	}
 	tried := 0
 	for _, c := range cands {
@@ -623,6 +631,16 @@ func extForMime(s string) string {
 		return ".mp4"
 	case "video/ogg", "application/ogg":
 		return ".ogv"
+	case "audio/mpeg", "audio/mp3":
+		return ".mp3"
+	case "audio/ogg", "audio/vorbis", "audio/opus":
+		return ".ogg"
+	case "audio/wav", "audio/x-wav", "audio/wave":
+		return ".wav"
+	case "audio/flac", "audio/x-flac":
+		return ".flac"
+	case "audio/mp4", "audio/aac", "audio/x-m4a":
+		return ".m4a"
 	}
 	if exts, _ := mime.ExtensionsByType(s); len(exts) > 0 {
 		for _, e := range exts {
