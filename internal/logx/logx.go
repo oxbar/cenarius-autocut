@@ -26,6 +26,18 @@ func StartJob(ctx context.Context, outDir string) (context.Context, string, io.C
 	return context.WithValue(ctx, ctxKey{}, l), path, f, nil
 }
 
+// ContinueJob appends to an existing job's debug.log (used by audio remixes,
+// so the original run's history is kept for debugging).
+func ContinueJob(ctx context.Context, outDir string) (context.Context, string, io.Closer, error) {
+	path := filepath.Join(outDir, "debug.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return ctx, "", nil, err
+	}
+	h := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug, AddSource: true})
+	return context.WithValue(ctx, ctxKey{}, slog.New(h)), path, f, nil
+}
+
 func From(ctx context.Context) *slog.Logger {
 	if ctx == nil {
 		return discard

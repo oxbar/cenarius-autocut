@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CENARIUS AutoCut v1.8 visual + audio smoke test.
+# CENARIUS AutoCut v1.9 visual + audio + montagem smoke test.
 # Runs the full pipeline (probe -> audio -> whisper stub -> semantic planner ->
 # asset resolver -> render) offline and checks that the output really is a
 # smart edit: A-roll + captions + zoom + video B-roll + Ken Burns still +
@@ -129,7 +129,11 @@ grep -q 'msg=planner.semantic_unit' "$LOG" || fail "planner semântico não regi
 grep -q 'msg=audio.music.plan' "$LOG" || fail "mood/trilha não planejados"
 grep -q 'msg=audio.music.resolved.*tier=local' "$LOG" || fail "trilha local não resolvida"
 grep -q 'msg=audio.music.render' "$LOG" || fail "trilha não mixada no render"
-grep -q 'sidechaincompress' "$OUT.filter" || fail "trilha sem ducking sob a voz"
+grep -q '\[voicen\]' "$OUT.filter" || fail "voz não normalizada antes da mixagem"
+grep -q "pow(10," "$OUT.filter" || fail "trilha sem ducking pelos trechos de fala"
+grep -q 'alimiter' "$OUT.filter" || fail "mix sem limitador final"
+grep -q '\[0:a\]loudnorm' "$OUT.filter" && fail "loudnorm na voz antes do amix encurta o vídeo"
+grep -q 'msg=audio.music.balance' "$LOG" || fail "balanço voz/música não registrado"
 grep -q '"mood": "' "$PLAN" || fail "edit-plan sem mood da trilha"
 grep -q '"name": "hit"' "$PLAN" || grep -q '"name": "impact"' "$PLAN" || fail "nenhum SFX emocional no plano"
 grep -q 'msg=visual.schedule.after' "$LOG" || fail "scheduler visual não registrado"
@@ -153,6 +157,33 @@ if [ -n "$FIRST_VIDEO_START" ]; then
   "$FFMPEG_BIN" -v error -y -ss 0.4 -i "$OUT" -frames:v 1 -vf "crop=1080:700:0:1100,scale=64:40" -f rawvideo -pix_fmt gray "$TMP/before.raw"
   cmp -s "$TMP/during.raw" "$TMP/before.raw" && fail "metade inferior idêntica ao A-roll durante o B-roll"
 fi
+
+# --- mixer: re-render only the audio with the music quieter ---------------
+"$ROOT/bin/cenarius" remix -config "$TMP/config.json" -o "$TMP/out" -music-db -30 -duck-db 14 >/dev/null
+grep -q 'msg=audio.remix.done' "$LOG" || fail "remix não concluído"
+grep -q '"gain_db": -30' "$TMP/out/audio-mix.json" || fail "mix do remix não registrado"
+REMIX_DUR=$("$FFPROBE_BIN" -v error -show_entries format=duration -of default=nw=1:nk=1 "$OUT")
+awk -v a="$IN_DUR" -v b="$REMIX_DUR" 'BEGIN { d=a-b; if (d<0) d=-d; if (d>0.20) { printf("ERRO duração após remix: input=%ss output=%ss\n", a, b) > "/dev/stderr"; exit 1 } }'
+echo "remix OK: música -30 dB abaixo da voz, duração ${REMIX_DUR}s"
+
+# --- Montagem IA: 3 clipes (horizontal, vertical e "iPhone" rotacionado) + prompt
+"$FFMPEG_BIN" -hide_banner -loglevel error -y -f lavfi -i "mandelbrot=size=640x360:rate=30" \
+  -f lavfi -i "sine=frequency=500:duration=4" -t 4 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$TMP/raw_rot.mp4"
+"$FFMPEG_BIN" -hide_banner -loglevel error -y -display_rotation 90 -i "$TMP/raw_rot.mp4" -c copy "$TMP/iphone_rot.mov"
+"$ROOT/bin/cenarius" assemble -config "$TMP/config.json" -o "$TMP/montagem" -prompt 'faça um meme "SMOKE MONTAGEM" com os clipes' \
+  -duration 12 "$TMP/assets/technology.mp4" "$TMP/input.mp4" "$TMP/iphone_rot.mov" >/dev/null
+M_OUT="$TMP/montagem/final.mp4"
+[ -s "$M_OUT" ] || fail "montagem: final.mp4 não gerado"
+MV=$("$FFPROBE_BIN" -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate,pix_fmt -of csv=p=0 "$M_OUT")
+MA=$("$FFPROBE_BIN" -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$M_OUT")
+[ "$MV" = "h264,1080,1920,yuv420p,30/1" ] || fail "montagem: vídeo inesperado: $MV"
+[ "$MA" = "aac" ] || fail "montagem: áudio inesperado: $MA"
+grep -q '"segments"' "$TMP/montagem/assembly-plan.json" || fail "montagem: roteiro ausente"
+grep -q 'SMOKE MONTAGEM' "$TMP/montagem/captions.ass" || fail "montagem: texto na tela ausente"
+grep -q 'msg=assembly.done' "$TMP/montagem/debug.log" || fail "montagem: não concluída"
+M_DUR=$("$FFPROBE_BIN" -v error -show_entries format=duration -of default=nw=1:nk=1 "$M_OUT")
+awk -v d="$M_DUR" 'BEGIN { if (d < 3 || d > 12*1.25+0.3) { printf("ERRO montagem com duração fora do alvo: %ss\n", d) > "/dev/stderr"; exit 1 } }'
+echo "montagem OK: ${M_DUR}s, $(grep -c '"clip_id"' "$TMP/montagem/assembly-plan.json") trechos"
 
 echo "duration input=${IN_DUR}s output=${OUT_DUR}s"
 echo "debug log: $LOG"

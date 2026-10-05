@@ -9,19 +9,31 @@ import (
 )
 
 type Config struct {
-	WorkDir  string        `json:"work_dir"`
-	FFmpeg   string        `json:"ffmpeg"`
-	FFprobe  string        `json:"ffprobe"`
-	YTDLP    string        `json:"yt_dlp"`
-	Whisper  WhisperConfig `json:"whisper"`
-	Ollama   OllamaConfig  `json:"ollama"`
-	Output   OutputConfig  `json:"output"`
-	Cuts     CutConfig     `json:"cuts"`
-	Captions CaptionConfig `json:"captions"`
-	Zoom     ZoomConfig    `json:"zoom"`
-	Broll    BrollConfig   `json:"broll"`
-	Shorts   ShortsConfig  `json:"shorts"`
-	Music    MusicConfig   `json:"music"`
+	WorkDir  string         `json:"work_dir"`
+	FFmpeg   string         `json:"ffmpeg"`
+	FFprobe  string         `json:"ffprobe"`
+	YTDLP    string         `json:"yt_dlp"`
+	Whisper  WhisperConfig  `json:"whisper"`
+	Ollama   OllamaConfig   `json:"ollama"`
+	Output   OutputConfig   `json:"output"`
+	Cuts     CutConfig      `json:"cuts"`
+	Captions CaptionConfig  `json:"captions"`
+	Zoom     ZoomConfig     `json:"zoom"`
+	Broll    BrollConfig    `json:"broll"`
+	Shorts   ShortsConfig   `json:"shorts"`
+	Music    MusicConfig    `json:"music"`
+	Assembly AssemblyConfig `json:"assembly"`
+}
+
+// AssemblyConfig controls "Montagem IA": several raw clips + a prompt become
+// one edited video. The director is the text model (ollama.model); the
+// vision model, when installed in Ollama, "watches" keyframes of every clip.
+type AssemblyConfig struct {
+	VisionModel     string  `json:"vision_model"`     // e.g. qwen2.5vl:7b / llava:7b; empty disables vision
+	MaxClips        int     `json:"max_clips"`        // upload limit per job
+	DefaultDuration float64 `json:"default_duration"` // seconds when the user does not choose
+	MaxSegment      float64 `json:"max_segment"`      // longest piece taken from one clip
+	Keyframes       int     `json:"keyframes"`        // frames per clip sent to the vision model
 }
 
 // MusicConfig controls the emotional sound layer: a mood-matched music bed
@@ -29,16 +41,22 @@ type Config struct {
 // Sources are licence-safe only: a local library (e.g. tracks you downloaded
 // from the YouTube Audio Library or bought) and Openverse CC audio.
 type MusicConfig struct {
-	Enabled    bool    `json:"enabled"`
-	File       string  `json:"file"`        // force a specific track (CLI -music)
-	Mood       string  `json:"mood"`        // auto | energetic | inspiring | tense | dramatic | chill | funny
-	Library    string  `json:"library"`     // folder with local tracks
-	Manifest   string  `json:"manifest"`    // moods/licence of local tracks
-	Remote     bool    `json:"remote"`      // Openverse CC music (no key)
-	GainDB     float64 `json:"gain_db"`     // bed level before ducking (-30..-14)
-	Duck       bool    `json:"duck"`        // sidechain the bed under the voice
-	Drops      bool    `json:"drops"`       // cut the music at punchlines
-	EmotionSFX bool    `json:"emotion_sfx"` // riser before / impact on punchlines
+	Enabled  bool   `json:"enabled"`
+	File     string `json:"file"`     // force a specific track (CLI -music)
+	Mood     string `json:"mood"`     // auto | energetic | inspiring | tense | dramatic | chill | funny
+	Library  string `json:"library"`  // folder with local tracks
+	Manifest string `json:"manifest"` // moods/licence of local tracks
+	Remote   bool   `json:"remote"`   // Openverse CC music (no key)
+	// Balance (v1.8.1): the voice is normalized to VoiceLUFS and the music is
+	// measured (EBU R128) and placed RELATIVE to the voice, so a loud mastered
+	// track can never beat the speech.
+	GainDB      float64 `json:"gain_db"`       // music loudness relative to the voice, in LU (-40..-12)
+	Duck        bool    `json:"duck"`          // lower the music while you speak
+	DuckDB      float64 `json:"duck_db"`       // extra reduction while speaking (3..24 dB)
+	VoiceGainDB float64 `json:"voice_gain_db"` // voice trim after normalization (-6..+6 dB)
+	SFXGainDB   float64 `json:"sfx_gain_db"`   // offset for all sound effects (-12..+6 dB)
+	Drops       bool    `json:"drops"`         // cut the music at punchlines
+	EmotionSFX  bool    `json:"emotion_sfx"`   // riser before / impact on punchlines
 }
 
 type WhisperConfig struct {
@@ -143,8 +161,9 @@ func Default() Config {
 		Captions: CaptionConfig{Enabled: true, FontName: "Arial", FontSize: 74, PrimaryColor: "&H00FFFFFF", HighlightColor: "&H0000D7FF", OutlineColor: "&H00000000", Outline: 5, Shadow: 0, MarginV: 560, SafeMargin: 112, MaxWords: 6, MaxCharsPerLine: 22, MaxLines: 2, Uppercase: true, ActiveWord: true, TimingOffset: 0.06, ActiveScale: 1.05, MaxWidthRatio: 0.80},
 		Zoom:     ZoomConfig{Enabled: true, Mild: 1.06, Emphasis: 1.085, Punch: 1.10, MinGap: 4.0, Duration: 0.85},
 		Shorts:   ShortsConfig{Enabled: true, MinDuration: 30, IdealMin: 40, IdealMax: 50, MaxDuration: 55, DefaultCount: 5, MaxCount: 10, MaxOverlap: 0.35, UseOllamaRank: true},
+		Assembly: AssemblyConfig{VisionModel: "qwen2.5vl:7b", MaxClips: 20, DefaultDuration: 30, MaxSegment: 8, Keyframes: 3},
 		Music: MusicConfig{Enabled: true, Mood: "auto", Library: "./assets/music", Manifest: "./assets/music/manifest.json",
-			Remote: true, GainDB: -20, Duck: true, Drops: true, EmotionSFX: true},
+			Remote: true, GainDB: -22, Duck: true, DuckDB: 10, Drops: true, EmotionSFX: true},
 		Broll: BrollConfig{Enabled: true, AssetDir: "./assets/broll", Manifest: "./assets/manifest.json", MaxEvents: 12,
 			MinVisualGap: 0.35, Remote: true, Procedural: true, AllowSelfBroll: true, MaxRemoteMB: 60,
 			ReactionSplit: 0.5, ReactionFocusY: 0.40, SeamCaptions: true},
@@ -230,15 +249,26 @@ func (c *Config) Normalize(base string) error {
 	if c.Broll.MaxRemoteMB <= 0 {
 		c.Broll.MaxRemoteMB = 60
 	}
+	if c.Assembly.MaxClips <= 0 || c.Assembly.MaxClips > 50 {
+		c.Assembly.MaxClips = 20
+	}
+	if c.Assembly.DefaultDuration < 5 || c.Assembly.DefaultDuration > 180 {
+		c.Assembly.DefaultDuration = 30
+	}
+	if c.Assembly.MaxSegment < 1 || c.Assembly.MaxSegment > 30 {
+		c.Assembly.MaxSegment = 8
+	}
+	if c.Assembly.Keyframes < 1 || c.Assembly.Keyframes > 6 {
+		c.Assembly.Keyframes = 3
+	}
 	c.Music.Mood = strings.ToLower(strings.TrimSpace(c.Music.Mood))
 	switch c.Music.Mood {
 	case "auto", "energetic", "inspiring", "tense", "dramatic", "chill", "funny":
 	default:
 		c.Music.Mood = "auto"
 	}
-	if c.Music.GainDB == 0 || c.Music.GainDB < -30 || c.Music.GainDB > -14 {
-		c.Music.GainDB = -20
-	}
+	c.Music.GainDB, c.Music.DuckDB, c.Music.VoiceGainDB, c.Music.SFXGainDB = ClampMusicBalance(
+		c.Music.GainDB, c.Music.DuckDB, c.Music.VoiceGainDB, c.Music.SFXGainDB)
 	if c.Music.Library == "" {
 		c.Music.Library = "./assets/music"
 	}
@@ -291,6 +321,39 @@ func LoadEnvFile(path string) error {
 		_ = os.Setenv(key, value)
 	}
 	return nil
+}
+
+// Loudness targets of the mix.
+const (
+	VoiceLUFS          = -16.0 // speech target (Reels/TikTok/Shorts friendly)
+	MinVoiceHeadroomLU = 12.0  // music is always at least this far below the voice
+)
+
+// ClampMusicBalance enforces the "voice always prevails" rule for every
+// source of settings (config file, CLI, web UI). A zero music/duck value means
+// "use the default".
+func ClampMusicBalance(music, duck, voice, sfx float64) (float64, float64, float64, float64) {
+	if music == 0 {
+		music = -22
+	}
+	music = clampF(music, -40, -MinVoiceHeadroomLU)
+	if duck == 0 {
+		duck = 10
+	}
+	duck = clampF(duck, 3, 24)
+	voice = clampF(voice, -6, 6)
+	sfx = clampF(sfx, -12, 6)
+	return music, duck, voice, sfx
+}
+
+func clampF(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func mathMax(a, b float64) float64 {

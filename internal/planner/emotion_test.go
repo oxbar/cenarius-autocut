@@ -119,3 +119,15 @@ func TestDirectorMusicMoodIsValidated(t *testing.T) {
 		t.Fatalf("invalid mood must be ignored: %+v %v", p.Music, err)
 	}
 }
+
+func TestSpeechRangesMergeBreaths(t *testing.T) {
+	units := []SemanticUnit{{Start: 0.2, End: 2.0}, {Start: 2.2, End: 4.0}, {Start: 6.0, End: 7.5}}
+	r := SpeechRanges(units, 0.45)
+	if len(r) != 2 || r[0].Start != 0.2 || r[0].End != 4.0 || r[1].Start != 6.0 {
+		t.Fatalf("%+v", r)
+	}
+	p := Heuristic(richTranscript(), config.Default())
+	if p.Music == nil || len(p.Music.Speech) == 0 {
+		t.Fatalf("music cue must carry speech ranges: %+v", p.Music)
+	}
+}

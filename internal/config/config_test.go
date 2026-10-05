@@ -25,3 +25,22 @@ func TestLoadEnvFileDoesNotOverrideEnvironment(t *testing.T) {
 		t.Fatalf("env file value not loaded: %q", got)
 	}
 }
+
+func TestMusicBalanceKeepsVoiceOnTop(t *testing.T) {
+	m, d, v, s := ClampMusicBalance(0, 0, 0, 0)
+	if m != -22 || d != 10 || v != 0 || s != 0 {
+		t.Fatalf("defaults: %v %v %v %v", m, d, v, s)
+	}
+	m, d, v, s = ClampMusicBalance(-3, 40, 20, 30) // user tries to put music over the voice
+	if m != -MinVoiceHeadroomLU || d != 24 || v != 6 || s != 6 {
+		t.Fatalf("limits not enforced: %v %v %v %v", m, d, v, s)
+	}
+	cfg := Default()
+	cfg.Music.GainDB = -5
+	if err := cfg.Normalize(""); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Music.GainDB > -MinVoiceHeadroomLU {
+		t.Fatalf("config allowed music too loud: %v", cfg.Music.GainDB)
+	}
+}

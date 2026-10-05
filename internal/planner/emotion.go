@@ -90,7 +90,31 @@ func PlanMusic(p Plan, dur float64, cfg config.MusicConfig) *MusicCue {
 	if cfg.Drops {
 		cue.Drops = planDrops(p.SemanticUnits, p.VisualEvents, dur)
 	}
+	cue.Speech = SpeechRanges(p.SemanticUnits, 0.45)
 	return cue
+}
+
+// SpeechRanges merges semantic units into "the voice is speaking" ranges.
+// Units already split at real pauses, so a gap shorter than mergeGap is a
+// breath, not a pause worth raising the music for.
+func SpeechRanges(units []SemanticUnit, mergeGap float64) []TimeRange {
+	var out []TimeRange
+	for _, u := range units {
+		if u.End <= u.Start {
+			continue
+		}
+		if n := len(out); n > 0 && u.Start-out[n-1].End < mergeGap {
+			if u.End > out[n-1].End {
+				out[n-1].End = u.End
+			}
+			continue
+		}
+		out = append(out, TimeRange{Start: round3(u.Start), End: round3(u.End)})
+	}
+	for i := range out {
+		out[i].End = round3(out[i].End)
+	}
+	return out
 }
 
 func planDrops(units []SemanticUnit, events []VisualEvent, dur float64) []MusicDrop {

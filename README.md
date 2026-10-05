@@ -148,7 +148,45 @@ reagido já é a trilha).
 ```
 
 Config (`music`): `enabled`, `file`, `mood`, `library`, `manifest`, `remote`,
-`gain_db` (−30..−14, padrão −20), `duck`, `drops`, `emotion_sfx`.
+`gain_db`, `duck`, `duck_db`, `voice_gain_db`, `sfx_gain_db`, `drops`, `emotion_sfx`.
+
+### Mixer: sua voz sempre prevalece (v1.8.1)
+
+A loudness da voz e da música é **medida** (EBU R128) e a mistura é feita em
+relação à voz — uma trilha masterizada alta nunca passa por cima da fala:
+
+| Controle | Config | Faixa | Padrão |
+|---|---|---|---|
+| Volume da música (abaixo da voz) | `gain_db` | −40 … −12 dB | −22 |
+| Abaixar a música quando eu falo | `duck_db` | 3 … 24 dB | 10 |
+| Minha voz (ajuste fino) | `voice_gain_db` | −6 … +6 dB | 0 |
+| Efeitos sonoros | `sfx_gain_db` | −12 … +6 dB | 0 |
+
+- A voz é levada a −16 LUFS por ganho estático (sem compressão que "bombeia").
+- O ducking segue os trechos em que você fala (da transcrição), com rampas de
+  0,2 s: determinístico, sem pumping.
+- A música **nunca** fica a menos de 12 dB da voz — o limite vale para config,
+  CLI e UI.
+- No fim só entra um limitador de pico (sem re-normalizar o mix).
+
+**Na UI** (`cenarius serve`): o painel *Edição IA* tem o **Mixer de áudio**
+com presets (*Voz em destaque*, *Equilibrado*, *Mais trilha*), sliders, liga/
+desliga da trilha e emoção. Depois do render, ouça no player e clique em
+**Aplicar mixer e re-renderizar**: só o áudio é refeito (sem transcrever nem
+buscar assets de novo).
+
+**No CLI**:
+
+```bash
+./bin/cenarius remix -o ./data/IMG_6825 -music-db -30 -duck-db 14   # música mais baixa
+./bin/cenarius remix -o ./data/IMG_6825 -voice-db 2                 # voz um pouco mais alta
+./bin/cenarius remix -o ./data/IMG_6825 -mood chill                 # troca a trilha
+./bin/cenarius remix -o ./data/IMG_6825 -no-music                   # tira a trilha
+```
+
+O `remix` acrescenta ao `debug.log` do job (`audio.music.balance` mostra a
+loudness medida da voz e da música e os ganhos aplicados) e grava o mix em
+`audio-mix.json`.
 
 > Não extraia música de vídeos do YouTube: Instagram/TikTok/YouTube detectam o
 > áudio (Content ID) e podem silenciar, bloquear ou dar strike no reel.
@@ -161,6 +199,44 @@ do conceito (ex.: programação → code, laptop, keyboard, screen…) precisam
 aparecer no alt/tags/slug do resultado. Resultado fora do tema é descartado
 (`visual.asset.candidate accepted=false reason=off-topic` no `debug.log`) e o
 ranking passa a ser 60% significado + 40% formato/posição.
+
+## Montagem IA — vários clipes + prompt → um vídeo (v1.9)
+
+Nova aba **Montagem IA** (e comando `assemble`): você envia vários pedaços de
+vídeo brutos e descreve o que quer ("faça um meme de…", "vídeo motivacional
+com…"). O CENARIUS trabalha como um editor:
+
+1. **Assiste cada clipe** — duração, fala (Whisper, com tempos por palavra),
+   frames-chave descritos por um **modelo de visão local** (Ollama), energia do
+   áudio e ritmo de cena. Clipes do iPhone com rotação são tratados.
+2. **Monta o roteiro** — o diretor (Ollama, `ollama.model`) escolhe a ordem
+   (gancho → desenvolvimento → punchline), descarta o que não serve, corta cada
+   trecho sem partir frases, escreve **textos na tela** estilo meme/título,
+   escolhe **efeitos** (whoosh, hit, impact…), **zoom** de ênfase, se o áudio
+   original fica e o **mood da trilha**. O Go valida tudo (clipe existe, tempos
+   dentro do clipe, duração perto do alvo). Sem Ollama, um editor heurístico
+   assume (ordem de envio, título do prompt, impacto no final).
+3. **Renderiza** — cada trecho vira 9:16 (horizontal ganha fundo desfocado),
+   a timeline passa pelo mesmo motor das outras abas: zoom, SFX, legenda da
+   fala, textos e **trilha com o mixer** (a voz continua prevalecendo). Depois,
+   dá para **re-renderizar só o áudio** pelo mixer.
+
+Visão (recomendado): `ollama pull qwen2.5vl:7b` (ou `llava:7b` em
+`assembly.vision_model`). Sem o modelo, os clipes são entendidos pela fala,
+movimento e nome do arquivo — nomes descritivos ajudam
+(`gato_no_teclado.mp4`).
+
+```bash
+./bin/cenarius assemble -prompt 'faça um meme "EU NA SEXTA 18H" sobre deploy' \
+  -duration 30 -o ./data/montagem clip1.mp4 clip2.mov clip3.mp4
+```
+
+Saídas em `-o`: `final.mp4`, `assembly-plan.json` (roteiro do editor, com o
+motivo de cada corte), `edit-plan.json`, `captions.ass`, `debug.log`
+(`assembly.clip.analyzed`, `assembly.plan.segment`, `assembly.timeline`).
+
+Config (`assembly`): `vision_model`, `max_clips` (20), `default_duration`
+(30 s), `max_segment` (8 s por trecho), `keyframes` (3 por clipe).
 
 ## Ajustando o estilo
 

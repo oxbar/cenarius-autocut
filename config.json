@@ -90,9 +90,19 @@
     "library": "./assets/music",
     "manifest": "./assets/music/manifest.json",
     "remote": true,
-    "gain_db": -20,
+    "gain_db": -22,
     "duck": true,
+    "duck_db": 10,
+    "voice_gain_db": 0,
+    "sfx_gain_db": 0,
     "drops": true,
     "emotion_sfx": true
+  },
+  "assembly": {
+    "vision_model": "qwen2.5vl:7b",
+    "max_clips": 20,
+    "default_duration": 30,
+    "max_segment": 8,
+    "keyframes": 3
   }
 }

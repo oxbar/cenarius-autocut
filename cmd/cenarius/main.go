@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"cenarius-autocut/internal/app"
+	"cenarius-autocut/internal/assembly"
 	"cenarius-autocut/internal/config"
 	"cenarius-autocut/internal/execx"
 	"cenarius-autocut/internal/shorts"
@@ -29,6 +30,10 @@ func main() {
 		react(os.Args[2:])
 	case "shorts":
 		shortsCmd(os.Args[2:])
+	case "remix":
+		remix(os.Args[2:])
+	case "assemble":
+		assemble(os.Args[2:])
 	case "doctor":
 		doctor(os.Args[2:])
 	default:
@@ -255,8 +260,99 @@ func doctor(args []string) {
 		os.Exit(1)
 	}
 }
+
+// assemble turns several raw clips + a prompt into one edited video.
+func assemble(args []string) {
+	fs := flag.NewFlagSet("assemble", flag.ExitOnError)
+	c := fs.String("config", "config.json", "config")
+	out := fs.String("o", "", "diretório de saída")
+	prompt := fs.String("prompt", "", "o que o vídeo final deve ser (ex.: \"meme de programador na sexta-feira\")")
+	duration := fs.Float64("duration", 0, "duração alvo em segundos (0 = padrão da config)")
+	caps := fs.String("captions", "auto", "legenda da fala: auto|on|off")
+	mf := musicFlags(fs)
+	fs.Parse(args)
+	files := fs.Args()
+	if len(files) == 0 || strings.TrimSpace(*prompt) == "" {
+		fatal(fmt.Errorf("use: assemble -prompt \"...\" clip1.mp4 clip2.mov ..."))
+	}
+	cfg := load(*c)
+	mf.apply(&cfg)
+	inputs := make([]assembly.Input, 0, len(files))
+	for _, f := range files {
+		if _, err := os.Stat(f); err != nil {
+			fatal(fmt.Errorf("clipe não encontrado: %s", f))
+		}
+		inputs = append(inputs, assembly.Input{Path: f, Name: filepath.Base(f)})
+	}
+	opts := assembly.Options{Prompt: strings.TrimSpace(*prompt), Duration: *duration}
+	switch *caps {
+	case "on":
+		v := true
+		opts.Captions = &v
+	case "off":
+		v := false
+		opts.Captions = &v
+	}
+	dir := *out
+	if dir == "" {
+		dir = filepath.Join(cfg.WorkDir, "montagem")
+	}
+	res, err := assembly.Run(context.Background(), cfg, inputs, opts, dir, func(st string, p int, d string) { fmt.Printf("[%3d%%] %-9s %s\n", p, st, d) })
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("\nRoteiro (%s, %s): %s\n", res.Plan.Origin, res.Plan.MusicMood, res.Plan.Title)
+	for i, s := range res.Plan.Segments {
+		fmt.Printf("  %d. %s %5.1fs-%5.1fs %-9s %s\n", i+1, s.ClipID, s.Start, s.End, s.Role, s.Text)
+	}
+	fmt.Printf("\nOK: %s (%.1fs)\n", res.Output, res.Duration)
+}
+
+// remix re-renders only the audio balance of a finished job.
+func remix(args []string) {
+	fs := flag.NewFlagSet("remix", flag.ExitOnError)
+	c := fs.String("config", "config.json", "config")
+	out := fs.String("o", "", "diretório de um job já concluído (contém cut.mp4 e edit-plan.json)")
+	musicDB := fs.Float64("music-db", 0, "música em relação à voz, em dB (-40..-12; 0 = padrão -22)")
+	duckDB := fs.Float64("duck-db", 0, "quanto a música abaixa quando você fala (3..24; 0 = padrão 10)")
+	voiceDB := fs.Float64("voice-db", 0, "ajuste fino da voz (-6..+6)")
+	sfxDB := fs.Float64("sfx-db", 0, "ajuste dos efeitos (-12..+6)")
+	mood := fs.String("mood", "", "troca a trilha: energetic|inspiring|tense|dramatic|chill|funny")
+	off := fs.Bool("no-music", false, "remove a trilha")
+	fs.Parse(args)
+	if *out == "" {
+		fatal(fmt.Errorf("use remix -o <diretório do job>"))
+	}
+	cfg := load(*c)
+	var s app.AudioSettings
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if set["music-db"] {
+		s.MusicDB = musicDB
+	}
+	if set["duck-db"] {
+		s.DuckDB = duckDB
+	}
+	if set["voice-db"] {
+		s.VoiceDB = voiceDB
+	}
+	if set["sfx-db"] {
+		s.SFXDB = sfxDB
+	}
+	if *off {
+		f := false
+		s.MusicEnabled = &f
+	}
+	s.Mood = *mood
+	res, err := app.Remix(context.Background(), cfg, *out, s, func(st string, p int, d string) { fmt.Printf("[%3d%%] %-8s %s\n", p, st, d) })
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("\nOK: %s\n", res.Output)
+}
+
 func usage() {
-	fmt.Println("CENARIUS Studio\n\n  cenarius doctor [-config config.json]\n  cenarius edit -i video.mp4 [-o data/cli]\n  cenarius react -i creator.mov -reaction video.mp4 [-audio duck]\n  cenarius shorts -i longo.mp4 [-count 5] [-generate]\n  cenarius shorts -url https://youtube.com/... [-count 5] [-generate]\n  cenarius serve [-addr 127.0.0.1:8484]")
+	fmt.Println("CENARIUS Studio\n\n  cenarius doctor [-config config.json]\n  cenarius edit -i video.mp4 [-o data/cli]\n  cenarius react -i creator.mov -reaction video.mp4 [-audio duck]\n  cenarius shorts -i longo.mp4 [-count 5] [-generate]\n  cenarius shorts -url https://youtube.com/... [-count 5] [-generate]\n  cenarius remix -o data/cli [-music-db -22] [-duck-db 10] [-voice-db 0] [-sfx-db 0] [-mood tense] [-no-music]\n  cenarius assemble -prompt \"faça um meme...\" [-duration 30] [-captions auto|on|off] [-o data/montagem] clip1.mp4 clip2.mov ...\n  cenarius serve [-addr 127.0.0.1:8484]")
 }
 func fatal(err error) {
 	if err != nil {

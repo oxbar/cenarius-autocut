@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -154,10 +155,22 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 	// can never extend the video), only when the voice track exists.
 	musicIdx := -1
 	timeline := 0.0
+	musicLUFS := -14.0 // typical mastered track, used only if measuring fails
+	voiceLUFS := math.NaN()
 	var musicCue *planner.MusicCue
 	if hasAudio && plan.Music != nil && plan.Music.Asset != nil && plan.Music.Asset.Path != "" {
 		if info, err := media.Probe(ctx, cfg.FFprobe, input); err == nil && info.Duration > 0 {
 			musicCue, timeline = plan.Music, info.Duration
+			if v, verr := MeasureLUFS(ctx, cfg.FFmpeg, input); verr == nil {
+				voiceLUFS = v
+			} else {
+				logger.Warn("audio.voice.loudness_unknown", "error", verr, "voice_gain_db", 0)
+			}
+			if lufs, lerr := MeasureLUFS(ctx, cfg.FFmpeg, plan.Music.Asset.Path); lerr == nil {
+				musicLUFS = lufs
+			} else {
+				logger.Warn("audio.music.loudness_unknown", "error", lerr, "assumed_lufs", musicLUFS)
+			}
 			args = append(args, "-stream_loop", "-1", "-t", fmt.Sprintf("%.3f", info.Duration+0.5), "-i", plan.Music.Asset.Path)
 			musicIdx = next
 			next++
@@ -261,20 +274,33 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 				duckItems = append(duckItems, it)
 			}
 		}
-		voiceLabel := "[0:a]"
+		// Balanced mode (music present): the voice is normalized on its own
+		// first, then everything else is placed relative to it.
+		balanced := musicIdx >= 0
+		voiceSrc := "[0:a]"
+		if balanced {
+			// Static gain from a measured loudness: no look-ahead delay (a
+			// loudnorm here would drop the last ~3 s through amix) and the
+			// natural dynamics of the speech are kept.
+			fmt.Fprintf(&fc, ";[0:a]volume=%.2fdB[voicen]", VoiceGainDB(voiceLUFS, cfg.Music))
+			voiceSrc = "[voicen]"
+		}
+		voiceLabel := voiceSrc
 		duckKeys := make([]string, len(duckItems))
 		musicKey := ""
 		keys := len(duckItems)
-		if musicIdx >= 0 && cfg.Music.Duck {
+		// Without speech ranges (old plans), fall back to a sidechain key.
+		sidechainMusic := balanced && cfg.Music.Duck && len(musicCue.Speech) == 0
+		if sidechainMusic {
 			keys++
 		}
 		if keys > 0 {
-			fmt.Fprintf(&fc, ";[0:a]asplit=%d[voicebase]", keys+1)
+			fmt.Fprintf(&fc, ";%sasplit=%d[voicebase]", voiceSrc, keys+1)
 			for i := range duckItems {
 				duckKeys[i] = fmt.Sprintf("[voicekey%d]", i)
 				fc.WriteString(duckKeys[i])
 			}
-			if musicIdx >= 0 && cfg.Music.Duck {
+			if sidechainMusic {
 				musicKey = "[voicekeymusic]"
 				fc.WriteString(musicKey)
 			}
@@ -301,20 +327,32 @@ func Final(ctx context.Context, cfg config.Config, input, assPath, output string
 			logger.Info("reaction.audio.event", "event", it.e.ID, "mode", it.e.Asset.AudioMode, "start", it.e.Start)
 		}
 
-		if musicIdx >= 0 {
-			fmt.Fprintf(&fc, ";%s", MusicChain(musicIdx, musicCue, musicKey, timeline))
+		if balanced {
+			gain := MusicGainDB(musicLUFS, cfg.Music)
+			fmt.Fprintf(&fc, ";%s", MusicChain(musicIdx, musicCue, cfg.Music, timeline, musicLUFS, musicKey))
 			labels = append(labels, "[music]")
+			logger.Info("audio.music.balance", "voice_measured_lufs", voiceLUFS, "voice_gain_db", VoiceGainDB(voiceLUFS, cfg.Music),
+				"voice_target_lufs", config.VoiceLUFS+cfg.Music.VoiceGainDB, "music_measured_lufs", musicLUFS,
+				"music_gain_db", gain, "music_below_voice_lu", -cfg.Music.GainDB, "duck", cfg.Music.Duck, "duck_db", cfg.Music.DuckDB,
+				"speech_ranges", len(musicCue.Speech), "sfx_offset_db", cfg.Music.SFXGainDB)
 		}
 
 		for i, sfx := range plan.SFX {
 			label := fmt.Sprintf("[sfx%d]", i)
 			delay := int(math.Round(sfx.Time * 1000))
-			gain := ClampSFXGain(sfx.GainDB)
+			gain := ClampSFXGain(sfx.GainDB) + cfg.Music.SFXGainDB
 			fmt.Fprintf(&fc, ";%s,volume=%.1fdB,adelay=%d|%d%s", sfxSource(sfx.Name), gain, delay, delay, label)
 			labels = append(labels, label)
 			logger.Info("audio.sfx.event", "name", sfx.Name, "time", sfx.Time, "gain_db", gain, "reason", sfx.Reason)
 		}
-		if len(labels) > 1 {
+		if balanced {
+			// No loudness re-normalization of the mix (it would lift the music
+			// in the pauses); only a peak limiter without auto-gain.
+			// duration=first ends ~0.13 s early in the full graph; mix the
+			// longest input and cut exactly at the timeline length instead.
+			fmt.Fprintf(&fc, ";%samix=inputs=%d:duration=longest:normalize=0,atrim=end=%.3f,alimiter=limit=0.89:level=0[aout]", strings.Join(labels, ""), len(labels), timeline)
+			audioMap = "[aout]"
+		} else if len(labels) > 1 {
 			fmt.Fprintf(&fc, ";%samix=inputs=%d:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]", strings.Join(labels, ""), len(labels))
 			audioMap = "[aout]"
 		}
@@ -364,26 +402,98 @@ func sfxSource(name string) string {
 	}
 }
 
-// MusicChain builds the music bed filter: stereo 48 kHz, base gain, 1.2 s
-// fade-in, 1.8 s fade-out, drops (music cut to ~5%% with a 0.4 s recovery) at
-// punchlines and, when key is set, sidechain ducking under the voice so the
-// speech always stays on top. Output label: [music].
-func MusicChain(idx int, cue *planner.MusicCue, key string, timeline float64) string {
+// VoiceGainDB brings the measured voice to the target loudness plus the user
+// trim. Unknown loudness (NaN) keeps the voice untouched apart from the trim.
+func VoiceGainDB(voiceLUFS float64, mc config.MusicConfig) float64 {
+	if math.IsNaN(voiceLUFS) {
+		return mc.VoiceGainDB
+	}
+	return math.Max(-20, math.Min(30, config.VoiceLUFS+mc.VoiceGainDB-voiceLUFS))
+}
+
+// MusicGainDB is the static gain that places a track measured at musicLUFS
+// exactly mc.GainDB LU below the (trimmed) voice target.
+func MusicGainDB(musicLUFS float64, mc config.MusicConfig) float64 {
+	target := config.VoiceLUFS + mc.VoiceGainDB + mc.GainDB
+	return math.Max(-50, math.Min(10, target-musicLUFS))
+}
+
+// MusicChain builds the music bed filter: stereo 48 kHz, loudness-matched
+// gain (relative to the voice), 1.2 s fade-in, 1.8 s fade-out, drops at
+// punchlines and ducking while the voice speaks. When the cue has speech
+// ranges the ducking is a deterministic envelope of exactly mc.DuckDB (no
+// pumping); otherwise, if key is set, a sidechain compressor is used.
+// Output label: [music].
+func MusicChain(idx int, cue *planner.MusicCue, mc config.MusicConfig, timeline, musicLUFS float64, key string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=%.1fdB,afade=t=in:st=0:d=1.2", idx, ClampMusicGain(cue.GainDB))
+	fmt.Fprintf(&b, "[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=%.1fdB,afade=t=in:st=0:d=1.2", idx, MusicGainDB(musicLUFS, mc))
 	if timeline > 3 {
 		fmt.Fprintf(&b, ",afade=t=out:st=%.3f:d=1.8", timeline-1.8)
 	}
 	if expr := DropExpr(cue.Drops); expr != "1" {
 		fmt.Fprintf(&b, ",volume='%s':eval=frame", expr)
 	}
-	if key != "" {
+	switch {
+	case mc.Duck && len(cue.Speech) > 0:
+		fmt.Fprintf(&b, ",volume='%s':eval=frame[music]", DuckExpr(cue.Speech, mc.DuckDB))
+	case mc.Duck && key != "":
 		b.WriteString("[musicraw];[musicraw]" + key + "sidechaincompress=threshold=0.02:ratio=8:attack=20:release=350:makeup=1[music]")
-	} else {
+	default:
 		b.WriteString("[music]")
 	}
 	return b.String()
 }
+
+// DuckExpr lowers the music by duckDB while the voice speaks, with 0.2 s
+// ramps. Ranges closer than the ramps are merged so the envelope never
+// flutters; the sum of non-overlapping trapezoids stays in [0,1].
+func DuckExpr(speech []planner.TimeRange, duckDB float64) string {
+	const ramp = 0.2
+	var merged []planner.TimeRange
+	for _, r := range speech {
+		if r.End <= r.Start {
+			continue
+		}
+		if n := len(merged); n > 0 && r.Start-merged[n-1].End < 2*ramp+0.05 {
+			if r.End > merged[n-1].End {
+				merged[n-1].End = r.End
+			}
+			continue
+		}
+		merged = append(merged, r)
+	}
+	if len(merged) == 0 || duckDB <= 0 {
+		return "1"
+	}
+	terms := make([]string, 0, len(merged))
+	for _, r := range merged {
+		terms = append(terms, fmt.Sprintf("clip(min((t-%.3f)/%.2f,(%.3f-t)/%.2f),0,1)", r.Start-ramp, ramp, r.End+ramp, ramp))
+	}
+	return fmt.Sprintf("pow(10,-%.2f/20*min(1,%s))", duckDB, strings.Join(terms, "+"))
+}
+
+// MeasureLUFS returns the integrated loudness (EBU R128) of the first
+// 3 minutes of an audio file.
+func MeasureLUFS(ctx context.Context, ffmpeg, path string) (float64, error) {
+	if ffmpeg == "" {
+		ffmpeg = "ffmpeg"
+	}
+	r, err := execx.Run(ctx, nil, ffmpeg, "-hide_banner", "-nostats", "-t", "180", "-i", path, "-vn", "-af", "ebur128=framelog=quiet", "-f", "null", "-")
+	if err != nil {
+		return 0, err
+	}
+	m := lufsRE.FindAllStringSubmatch(r.Stderr, -1)
+	if len(m) == 0 {
+		return 0, fmt.Errorf("loudness não encontrada na saída do ebur128")
+	}
+	v, err := strconv.ParseFloat(m[len(m)-1][1], 64)
+	if err != nil || v < -69 {
+		return 0, fmt.Errorf("trilha silenciosa ou inválida (%s LUFS)", m[len(m)-1][1])
+	}
+	return v, nil
+}
+
+var lufsRE = regexp.MustCompile(`I:\s+(-?[0-9.]+) LUFS`)
 
 // DropExpr is the volume envelope for music drops (1 = untouched).
 func DropExpr(drops []planner.MusicDrop) string {
@@ -398,14 +508,6 @@ func DropExpr(drops []planner.MusicDrop) string {
 			d.Start, d.End, d.End, d.End+0.4, d.End, expr)
 	}
 	return expr
-}
-
-// ClampMusicGain keeps the bed under the voice: -30..-14 dB before ducking.
-func ClampMusicGain(g float64) float64 {
-	if g == 0 {
-		g = -20
-	}
-	return math.Max(-30, math.Min(-14, g))
 }
 
 func firstNonEmpty(xs ...string) string {

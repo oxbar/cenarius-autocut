@@ -20,6 +20,9 @@
     <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M20 13a8 8 0 1 0-16 0"/><path d="M12 13 16 9"/><path d="M4 17h16"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18M17 3v18M3 7.5h4M3 12h18M3 16.5h4M17 7.5h4M17 16.5h4"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
   </svg>
 
@@ -37,6 +40,7 @@
       <button class="tab active" data-tab="auto"><svg><use href="#i-sparkles"/></svg><span>Edição IA</span></button>
       <button class="tab" data-tab="reaction"><svg><use href="#i-video"/></svg><span>Reagir a vídeo</span></button>
       <button class="tab" data-tab="shorts"><svg><use href="#i-scissors"/></svg><span>Longo → Shorts</span></button>
+      <button class="tab" data-tab="assembly"><svg><use href="#i-film"/></svg><span>Montagem IA</span></button>
     </nav>
 
     <section class="panel active" id="panel-auto">
@@ -55,6 +59,40 @@
         <div><svg><use href="#i-caption"/></svg><span>Legenda dinâmica</span></div>
         <div><svg><use href="#i-sparkles"/></svg><span>B-roll contextual</span></div>
         <div><svg><use href="#i-gauge"/></svg><span>Ritmo editorial</span></div>
+      </div>
+      <div class="mixer-slot">
+      <section class="mixer" id="mixer" aria-label="Mixer de áudio">
+        <div class="mixer-head">
+          <div><h3>Mixer de áudio</h3><p>Sua voz sempre fica por cima: a música nunca passa de 12 dB abaixo dela.</p></div>
+          <label class="mix-switch"><input type="checkbox" id="mix-music" checked><span>Trilha de fundo</span></label>
+        </div>
+        <div class="mix-presets" role="group" aria-label="Presets">
+          <button type="button" class="preset" data-music="-30" data-duck="14" data-voice="0" data-sfx="-2">Voz em destaque</button>
+          <button type="button" class="preset active" data-music="-22" data-duck="10" data-voice="0" data-sfx="0">Equilibrado</button>
+          <button type="button" class="preset" data-music="-16" data-duck="8" data-voice="0" data-sfx="0">Mais trilha</button>
+        </div>
+        <div class="mix-grid">
+          <label class="mix-row" data-needs-music><span class="mix-label">Volume da música</span><strong class="mix-value" id="mix-music-db-out"></strong>
+            <input type="range" id="mix-music-db" min="-40" max="-12" step="1" value="-22" aria-describedby="mix-music-db-out"><small>mais baixa ← → mais alta</small></label>
+          <label class="mix-row" data-needs-music><span class="mix-label">Abaixar a música quando eu falo</span><strong class="mix-value" id="mix-duck-db-out"></strong>
+            <input type="range" id="mix-duck-db" min="3" max="24" step="1" value="10" aria-describedby="mix-duck-db-out"><small>pouco ← → muito</small></label>
+          <label class="mix-row"><span class="mix-label">Minha voz</span><strong class="mix-value" id="mix-voice-db-out"></strong>
+            <input type="range" id="mix-voice-db" min="-6" max="6" step="0.5" value="0" aria-describedby="mix-voice-db-out"><small>ajuste fino após a normalização</small></label>
+          <label class="mix-row"><span class="mix-label">Efeitos sonoros</span><strong class="mix-value" id="mix-sfx-db-out"></strong>
+            <input type="range" id="mix-sfx-db" min="-12" max="6" step="1" value="0" aria-describedby="mix-sfx-db-out"><small>whoosh, pop, riser, impact</small></label>
+        </div>
+        <label class="field mix-mood" data-needs-music><span>Emoção da trilha</span>
+          <select id="mix-mood">
+            <option value="auto" selected>Automática (pela fala)</option>
+            <option value="energetic">Energética</option>
+            <option value="inspiring">Inspiradora</option>
+            <option value="tense">Tensa</option>
+            <option value="dramatic">Dramática</option>
+            <option value="chill">Tranquila</option>
+            <option value="funny">Divertida</option>
+          </select>
+        </label>
+      </section>
       </div>
       <button class="button primary" id="auto-run"><svg><use href="#i-sparkles"/></svg>Gerar vídeo</button>
     </section>
@@ -108,6 +146,38 @@
       </div>
       <button class="button primary" id="shorts-analyze"><svg><use href="#i-gauge"/></svg>Encontrar melhores cortes</button>
       <div id="shorts-results" class="results hidden"></div>
+    </section>
+
+    <section class="panel" id="panel-assembly">
+      <div class="section-head">
+        <div><h2>Montagem IA</h2><p>Envie vários clipes brutos e descreva o vídeo. A IA assiste cada pedaço, escolhe a ordem, corta, coloca texto e som — como um editor profissional.</p></div>
+      </div>
+      <label class="dropzone compact" id="assembly-drop">
+        <svg><use href="#i-upload"/></svg>
+        <strong>Arraste vários clipes aqui</strong>
+        <span>MP4 · MOV · WEBM · M4V — a ordem de envio vira a sugestão de narrativa</span>
+        <input type="file" id="assembly-files" accept="video/*" multiple hidden>
+        <span class="button secondary">Escolher clipes</span>
+      </label>
+      <ol class="clip-queue" id="assembly-queue" aria-label="Clipes da montagem"></ol>
+      <label class="field prompt-field"><span>O que você quer que a IA monte?</span>
+        <textarea id="assembly-prompt" rows="4" maxlength="1000" placeholder="Ex.: faça um meme de programador quando o deploy quebra na sexta-feira, com texto “EU NA SEXTA 18H” no começo"></textarea>
+      </label>
+      <div class="prompt-examples" aria-label="Exemplos de prompt">
+        <button type="button" class="preset example">Meme engraçado com os melhores momentos</button>
+        <button type="button" class="preset example">Vídeo motivacional com frase de impacto no final</button>
+        <button type="button" class="preset example">Resumo rápido estilo antes e depois</button>
+      </div>
+      <div class="settings-row">
+        <label class="field"><span>Duração do vídeo final</span>
+          <select id="assembly-duration"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="45">45 s</option><option value="60">60 s</option><option value="0">Automática</option></select>
+        </label>
+        <label class="field"><span>Legenda da fala</span>
+          <select id="assembly-captions"><option value="auto" selected>A IA decide</option><option value="on">Sempre</option><option value="off">Nunca</option></select>
+        </label>
+      </div>
+      <div class="mixer-slot"></div>
+      <button class="button primary" id="assembly-run"><svg><use href="#i-film"/></svg>Montar vídeo</button>
     </section>
 
     <aside class="job-card hidden" id="job-card">

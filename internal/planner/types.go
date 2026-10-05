@@ -145,6 +145,12 @@ type MusicDrop struct {
 	Reason string  `json:"reason,omitempty"`
 }
 
+// TimeRange is a time interval on the edited timeline.
+type TimeRange struct {
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+}
+
 // MusicCue is the emotional sound direction: one mood-matched bed under the
 // voice (ducked while speaking) with dramatic drops.
 type MusicCue struct {
@@ -152,11 +158,12 @@ type MusicCue struct {
 	Queries []string    `json:"queries,omitempty"`
 	GainDB  float64     `json:"gain_db"`
 	Drops   []MusicDrop `json:"drops,omitempty"`
+	Speech  []TimeRange `json:"speech,omitempty"` // where the voice is: music ducks here
 	Asset   *AssetRef   `json:"asset,omitempty"`
 	Reason  string      `json:"reason,omitempty"`
 }
 
-const PlanVersion = "1.8"
+const PlanVersion = "1.9"
 
 // MigrateLegacy converts legacy overlays into visual events so old plans and
 // old-style Ollama answers keep working.
